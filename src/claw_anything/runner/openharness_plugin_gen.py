@@ -742,7 +742,20 @@ def _handle_gmail_clone(tool_name: str, payload: dict) -> tuple[int, Any]:
 
 def _handle_my_expenses(tool_name: str, payload: dict) -> tuple[int, Any]:
     state = _LOCAL_GUI_STATE.setdefault("my_expenses", {})
+    accounts = state.setdefault("accounts", [])
     transactions = state.setdefault("transactions", [])
+
+    if tool_name.endswith("_list_accounts"):
+        query = payload.get("query")
+        matches = [account for account in accounts if _text_match(query, *account.values())]
+        return 200, {"accounts": matches, "total": len(matches), "returned": len(matches)}
+
+    if tool_name.endswith("_get_account"):
+        account_id = payload.get("account_id")
+        account = _find_record(accounts, account_id, "account_id", "id", "name", "label")
+        if account is None:
+            return (400 if not account_id else 404), {"error": f"Account not found: {account_id}"}
+        return 200, account
 
     if tool_name.endswith("_list_transactions"):
         start = payload.get("date_from") or payload.get("start_date")
@@ -813,6 +826,13 @@ def _handle_loop_habit(tool_name: str, payload: dict) -> tuple[int, Any]:
         matches = [habit for habit in habits if _text_match(query, habit.get("habit_id"), habit.get("name"), habit.get("frequency"), habit.get("unit"))]
         return 200, {"habits": matches, "total": len(matches), "returned": len(matches)}
 
+    if tool_name.endswith("_get_habit"):
+        habit_id = payload.get("habit_id")
+        habit = _find_record(habits, habit_id, "habit_id", "id")
+        if habit is None:
+            return (400 if not habit_id else 404), {"error": f"Habit not found: {habit_id}"}
+        return 200, habit
+
     if tool_name.endswith("_check_habit") or tool_name.endswith("_check_in"):
         habit_id = payload.get("habit_id")
         habit = _find_record(habits, habit_id, "habit_id", "id")
@@ -839,6 +859,51 @@ def _handle_loop_habit(tool_name: str, payload: dict) -> tuple[int, Any]:
         return 200, {"habit_id": habit_id, "completions": completions, "total": len(completions)}
 
     return 404, {"error": f"Unsupported Loop Habit tool: {tool_name}"}
+
+
+def _handle_clock(tool_name: str, payload: dict) -> tuple[int, Any]:
+    state = _LOCAL_GUI_STATE.setdefault("clock", {})
+    alarms = state.setdefault("alarms", [])
+
+    if tool_name.endswith("_list_alarms"):
+        query = payload.get("query")
+        matches = [alarm for alarm in alarms if _text_match(query, alarm.get("alarm_id"), alarm.get("time"), alarm.get("label"))]
+        return 200, {"alarms": matches, "total": len(matches), "returned": len(matches)}
+
+    if tool_name.endswith("_get_alarm"):
+        alarm_id = payload.get("alarm_id")
+        alarm = _find_record(alarms, alarm_id, "alarm_id", "id")
+        if alarm is None:
+            return (400 if not alarm_id else 404), {"error": f"Alarm not found: {alarm_id}"}
+        return 200, alarm
+
+    if tool_name.endswith("_create_alarm"):
+        time_value = str(payload.get("time") or "").strip()
+        if not time_value:
+            return 400, {"error": "time is required"}
+        alarm = {
+            "alarm_id": f"ALRM-LOCAL-{len(alarms) + 1}",
+            "time": time_value,
+            "label": payload.get("label") or "",
+            "repeat_days": payload.get("repeat_days") or [],
+            "enabled": bool(payload.get("enabled", True)),
+            "ringtone": payload.get("ringtone") or "Default alarm sound",
+            "vibrate": bool(payload.get("vibrate", True)),
+        }
+        alarms.append(alarm)
+        return 200, {"status": "created", **alarm}
+
+    if tool_name.endswith("_update_alarm"):
+        alarm_id = payload.get("alarm_id")
+        alarm = _find_record(alarms, alarm_id, "alarm_id", "id")
+        if alarm is None:
+            return (400 if not alarm_id else 404), {"error": f"Alarm not found: {alarm_id}"}
+        for key in ("time", "label", "repeat_days", "enabled", "ringtone", "vibrate"):
+            if key in payload:
+                alarm[key] = payload[key]
+        return 200, {"status": "updated", "alarm_id": alarm_id}
+
+    return 404, {"error": f"Unsupported Clock tool: {tool_name}"}
 
 
 def _handle_dialer(tool_name: str, payload: dict) -> tuple[int, Any]:
@@ -963,6 +1028,8 @@ def _handle_local_gui_tool(tool_name: str, endpoint_url: str, payload: dict) -> 
         return _handle_my_expenses(tool_name, payload)
     if app == "loop_habit" or tool_name.startswith("loop_habit") or tool_name.startswith("loop_habits"):
         return _handle_loop_habit(tool_name, payload)
+    if app == "clock" or tool_name.startswith("clock"):
+        return _handle_clock(tool_name, payload)
     if app == "dialer" or tool_name.startswith("dialer"):
         return _handle_dialer(tool_name, payload)
     if app == "mattermost" or tool_name.startswith("mattermost"):
@@ -1143,6 +1210,10 @@ def _normalize_local_loop_habit(raw: Any) -> list[dict]:
     return _normalize_record_list(raw, "habit_id", "HAB")
 
 
+def _normalize_local_clock(raw: Any) -> list[dict]:
+    return _normalize_record_list(raw, "alarm_id", "ALRM")
+
+
 def _normalize_local_dialer(raw: Any) -> list[dict]:
     return _normalize_record_list(raw, "call_id", "CALL")
 
@@ -1225,6 +1296,10 @@ def _build_local_gui_state(task: TaskDefinition) -> dict[str, Any]:
         elif "loop_habit_gui" in fixture:
             state["loop_habit"] = {
                 "habits": _normalize_local_loop_habit(raw),
+            }
+        elif "clock_gui" in fixture:
+            state["clock"] = {
+                "alarms": _normalize_local_clock(raw),
             }
         elif "dialer_gui" in fixture:
             state["dialer"] = {

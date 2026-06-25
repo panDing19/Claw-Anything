@@ -183,7 +183,7 @@ Scoring criteria:
         # Check coverage of involved services
         service_checks = [
             bool(called & {"fossify_calendar_list_events", "fossify_calendar_get_event"}),
-            bool(called & {"my_expenses_gui_list_expenses", "my_expenses_gui_get_expense"}),
+            bool(called & {"my_expenses_list_transactions", "my_expenses_get_transaction"}),
             bool(called & {"claw_obsidian_list_notes", "claw_obsidian_get_note", "claw_obsidian_search"}),
             bool(called & {"fossify_notes_list_notes", "fossify_notes_get_note"}),
         ]
@@ -192,7 +192,7 @@ Scoring criteria:
         # Depth: detail/get calls
         detail_tools = {
             "fossify_calendar_get_event",
-            "my_expenses_gui_get_expense",
+            "my_expenses_get_transaction",
             "claw_obsidian_get_note",
             "fossify_notes_get_note",
         }
@@ -221,7 +221,7 @@ Scoring criteria:
 
         # My Expenses TXN-001 (0.25)
         my_expenses_accessed = any(
-            d.tool_name == "my_expenses_gui_get_expense" and
+            d.tool_name == "my_expenses_get_transaction" and
             d.request_body.get("expense_id") == "TXN-001"
             for d in dispatches
         )

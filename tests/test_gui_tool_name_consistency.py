@@ -8,6 +8,17 @@ import yaml
 
 GUI_TOOL_RE = re.compile(r"\b([a-z][a-z0-9_]*_gui_[a-z0-9_]+)\b")
 
+KNOWN_GUI_TOOL_ALIASES = {
+    "loop_habit_gui_list_habits": "loop_habits_list_habits",
+    "loop_habit_gui_get_habit": "loop_habits_get_habit",
+    "loop_habit_gui_check_habit": "loop_habits_check_habit",
+    "my_expenses_gui_list_accounts": "my_expenses_list_accounts",
+    "my_expenses_gui_get_account": "my_expenses_get_account",
+    "my_expenses_gui_create_transaction": "my_expenses_add_transaction",
+    "my_expenses_gui_list_expenses": "my_expenses_list_transactions",
+    "my_expenses_gui_get_expense": "my_expenses_get_transaction",
+}
+
 
 def test_gui_graders_and_task_text_use_exposed_tool_names() -> None:
     """Legacy GUI task text sometimes used ``*_gui_*`` tool names.
@@ -42,7 +53,10 @@ def test_gui_graders_and_task_text_use_exposed_tool_names() -> None:
                 continue
             text = path.read_text(encoding="utf-8", errors="ignore")
             for old_name in sorted(set(GUI_TOOL_RE.findall(text))):
-                exposed_name = old_name.replace("_gui_", "_", 1)
+                exposed_name = KNOWN_GUI_TOOL_ALIASES.get(
+                    old_name,
+                    old_name.replace("_gui_", "_", 1),
+                )
                 if old_name not in exposed and exposed_name in exposed:
                     mismatches.append(
                         f"{path.relative_to(root.parents[0])}: "
@@ -50,3 +64,38 @@ def test_gui_graders_and_task_text_use_exposed_tool_names() -> None:
                     )
 
     assert not mismatches, "\n".join(mismatches)
+
+
+def test_gui_tool_called_scoring_uses_exposed_tools() -> None:
+    root = Path(__file__).resolve().parents[1] / "benchmark/gui"
+    missing: list[str] = []
+
+    for task_dir in sorted(path for path in root.iterdir() if path.is_dir()):
+        task_yaml = task_dir / "task.yaml"
+        if not task_yaml.exists():
+            continue
+
+        data = yaml.safe_load(task_yaml.read_text(encoding="utf-8")) or {}
+        exposed = {
+            tool.get("name")
+            for tool in data.get("tools", [])
+            if isinstance(tool, dict)
+        }
+        exposed.update(
+            endpoint.get("tool_name")
+            for endpoint in data.get("tool_endpoints", [])
+            if isinstance(endpoint, dict)
+        )
+
+        for component in data.get("scoring_components", []) or []:
+            check = component.get("check") if isinstance(component, dict) else None
+            if not isinstance(check, dict) or check.get("type") != "tool_called":
+                continue
+            tool_name = check.get("tool_name")
+            if tool_name and tool_name not in exposed:
+                missing.append(
+                    f"{task_yaml.relative_to(root.parents[0])}: "
+                    f"scoring tool {tool_name} is not exposed"
+                )
+
+    assert not missing, "\n".join(missing)

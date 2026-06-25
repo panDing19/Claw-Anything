@@ -193,7 +193,7 @@ Scoring criteria:
 
         # Check coverage of required services
         service_checks = [
-            bool(called & {"loop_habit_gui_list_habits", "loop_habit_gui_get_habit"}),
+            bool(called & {"loop_habits_list_habits", "loop_habits_get_habit"}),
             bool(called & {"claw_obsidian_list_notes", "claw_obsidian_get_note"}),
             bool(called & {"scheduler_list_jobs", "scheduler_get_job", "scheduler_job_history"}),
             bool(called & {"workmail_send_message"}),
@@ -203,7 +203,7 @@ Scoring criteria:
 
         # Check depth (detail/get calls)
         detail_tools = {
-            "loop_habit_gui_get_habit",
+            "loop_habits_get_habit",
             "claw_obsidian_get_note",
             "scheduler_get_job",
             "scheduler_job_history",

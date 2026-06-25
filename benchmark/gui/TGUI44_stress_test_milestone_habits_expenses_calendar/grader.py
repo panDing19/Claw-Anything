@@ -181,7 +181,7 @@ Scoring criteria:
 
         # Check coverage of required services
         service_checks = [
-            bool(called & {"loop_habit_gui_list_habits", "loop_habit_gui_get_habit"}),
+            bool(called & {"loop_habits_list_habits", "loop_habits_get_habit"}),
             bool(called & {"finance_list_transactions", "finance_get_transaction"}),
             bool(called & {"fossify_calendar_create_event"}),
             bool(called & {"fossify_messages_send_message"}),
@@ -190,7 +190,7 @@ Scoring criteria:
 
         # Check depth (detail/get calls and write operations)
         detail_tools = {
-            "loop_habit_gui_get_habit",
+            "loop_habits_get_habit",
             "finance_get_transaction",
             "fossify_calendar_create_event",
             "fossify_messages_send_message",
@@ -211,7 +211,7 @@ Scoring criteria:
         
         # Check if agent verified the habit milestone (30-day streak)
         habit_accessed = any(
-            d.tool_name == "loop_habit_gui_get_habit"
+            d.tool_name == "loop_habits_get_habit"
             for d in dispatches
         )
         if habit_accessed:

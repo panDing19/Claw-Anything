@@ -169,7 +169,7 @@ Scoring criteria:
 
         # Check coverage of required services
         service_checks = [
-            bool(called & {"my_expenses_gui_list_expenses", "my_expenses_gui_get_expense"}),
+            bool(called & {"my_expenses_list_transactions", "my_expenses_get_transaction"}),
             bool(called & {"kb_search", "kb_get_article"}),
             bool(called & {"finance_list_transactions", "finance_get_transaction"}),
             bool(called & {"claw_notion_search", "claw_notion_get_page", "claw_notion_list_pages"}),
@@ -178,7 +178,7 @@ Scoring criteria:
 
         # Check depth (detail/get calls)
         detail_tools = {
-            "my_expenses_gui_get_expense",
+            "my_expenses_get_transaction",
             "kb_get_article",
             "finance_get_transaction",
             "claw_notion_get_page",
@@ -199,7 +199,7 @@ Scoring criteria:
 
         # Check if TXN-301 (the training expense) was identified
         txn_301_accessed = any(
-            d.tool_name in {"my_expenses_gui_list_expenses", "my_expenses_gui_get_expense"}
+            d.tool_name in {"my_expenses_list_transactions", "my_expenses_get_transaction"}
             and (
                 (isinstance(d.response_body, dict) and "TXN-301" in str(d.response_body))
                 or (isinstance(d.response_body, list) and any("TXN-301" in str(item) for item in d.response_body))

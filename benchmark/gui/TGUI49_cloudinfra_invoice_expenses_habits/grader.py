@@ -128,7 +128,7 @@ Scoring criteria:
 
         # ---- Sub-item 2: Key action completion (rule-based) — 15% ----
         # Check if habit was marked complete
-        if any(d.tool_name == "loop_habit_gui_check_habit" for d in dispatches):
+        if any(d.tool_name == "loop_habits_check_habit" for d in dispatches):
             completion += 0.15
 
         # ---- Sub-item 3: Output quality (LLM judge) — 35% ----
@@ -190,14 +190,14 @@ Scoring criteria:
         service_checks = [
             bool(called & {"workmail_list_messages", "workmail_get_message"}),
             bool(called & {"finance_list_transactions"}),
-            bool(called & {"loop_habit_gui_list_habits", "loop_habit_gui_check_habit"}),
+            bool(called & {"loop_habits_list_habits", "loop_habits_check_habit"}),
         ]
         breadth = sum(service_checks) / len(service_checks) if service_checks else 0
 
         # Check depth: detail/get calls
         detail_tools = {
             "workmail_get_message",
-            "loop_habit_gui_get_habit",
+            "loop_habits_get_habit",
         }
         detail_count = len([d for d in dispatches if d.tool_name in detail_tools])
         depth = min(detail_count / 2, 1.0)

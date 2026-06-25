@@ -163,6 +163,13 @@ def test_openharness_plugin_embeds_inject_gui_fixtures() -> None:
     assert any(contact["contact_id"] == "GCON-901" for contact in state["contacts"]["contacts"])
     assert any(product["product_id"] == "PROD-5001" for product in state["testmall"]["products"])
 
+    task = TaskDefinition.from_yaml(
+        root / "benchmark/gui/TGUI02_habit_gap_calendar_clock_replan/task.yaml"
+    )
+    state = _build_local_gui_state(task)
+
+    assert any(alarm["alarm_id"] == "ALRM-101" for alarm in state["clock"]["alarms"])
+
 
 def test_generated_openharness_plugin_serves_declared_gui_endpoints_locally(monkeypatch) -> None:
     base_mod = types.ModuleType("openharness.tools.base")
