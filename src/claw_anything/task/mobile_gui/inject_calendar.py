@@ -13,6 +13,7 @@ import os
 import random
 import subprocess
 import sys
+import time
 from datetime import datetime
 
 _ADB_BIN = "adb"
@@ -28,20 +29,61 @@ def _adb_prefix(device: str | None = None) -> str:
     return _ADB_BIN
 
 
+def _wait_for_device(device: str | None = None, timeout_s: float = 30.0) -> bool:
+    prefix = _adb_prefix(device)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        result = subprocess.run(
+            f"{prefix} get-state",
+            shell=True,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip() == "device":
+            return True
+        time.sleep(1)
+    return False
+
+
+def _transient_adb_error(message: str) -> bool:
+    lowered = message.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "device offline",
+            "device not found",
+            "device unauthorized",
+            "closed",
+            "transport",
+        )
+    )
+
+
 def execute_adb(cmd: str, device: str | None = None, root_required: bool = False) -> tuple[bool, str]:
     prefix = _adb_prefix(device)
     full_cmd = cmd if cmd.startswith("adb") else f"{prefix} {cmd}"
     env = os.environ.copy()
-    if root_required:
-        check = subprocess.run(
-            f"{prefix} shell whoami", shell=True, capture_output=True, text=True, env=env
-        )
-        if check.returncode == 0 and check.stdout.strip() != "root":
-            subprocess.run(f"{prefix} root", shell=True, capture_output=True, text=True, env=env)
-    result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, env=env)
-    if result.returncode == 0:
-        return True, result.stdout.strip()
-    return False, result.stderr.strip() or "Command failed"
+    last_error = "Command failed"
+    for attempt in range(4):
+        if not _wait_for_device(device):
+            last_error = "adb device not ready"
+        else:
+            if root_required:
+                check = subprocess.run(
+                    f"{prefix} shell whoami", shell=True, capture_output=True, text=True, env=env
+                )
+                if check.returncode == 0 and check.stdout.strip() != "root":
+                    subprocess.run(f"{prefix} root", shell=True, capture_output=True, text=True, env=env)
+                    _wait_for_device(device)
+            result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, env=env)
+            if result.returncode == 0:
+                return True, result.stdout.strip()
+            last_error = result.stderr.strip() or result.stdout.strip() or "Command failed"
+        if attempt < 3 and _transient_adb_error(last_error):
+            time.sleep(1 + attempt)
+            continue
+        break
+    return False, last_error
 
 
 def _ts(date_str: str) -> int:

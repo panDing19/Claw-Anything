@@ -212,6 +212,35 @@ def test_openharness_plugin_normalizes_label_wrapped_my_expenses_fixture() -> No
     assert data["transactions"][0]["category"] == "SaaS Subscriptions"
 
 
+def test_my_expenses_multi_container_duplicates_keep_latest_record() -> None:
+    root = Path(__file__).resolve().parents[1]
+    fixture = (
+        root
+        / "benchmark/gui/TGUI51_incident_dinner_expense_calendar"
+        / "fixtures/gui/my_expenses_gui/data.json"
+    )
+    raw = json.loads(fixture.read_text(encoding="utf-8"))
+
+    injected = gui_init._normalize_my_expenses_data(raw)
+    injected_txn = [
+        txn for txn in injected["transactions"]
+        if txn.get("transaction_id") == "txn_001"
+    ]
+    assert len(injected_txn) == 1
+    assert injected_txn[0]["payee"] == "Sichuan Restaurant - Xujiahui"
+    assert all(txn.get("account") != "acc_personal_card" for txn in injected["transactions"])
+
+    state = _normalize_local_my_expenses(raw)
+    local_txn = [
+        txn for txn in state["transactions"]
+        if txn.get("transaction_id") == "txn_001"
+    ]
+    assert len(local_txn) == 1
+    assert local_txn[0]["payee"] == "Sichuan Restaurant - Xujiahui"
+    assert local_txn[0]["account"] == "Personal Credit Card"
+    assert local_txn[0]["category"] == "On-Call Incident Response"
+
+
 def test_generated_openharness_plugin_serves_declared_gui_endpoints_locally(monkeypatch) -> None:
     base_mod = types.ModuleType("openharness.tools.base")
 

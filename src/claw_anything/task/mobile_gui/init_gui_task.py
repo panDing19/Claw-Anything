@@ -1134,6 +1134,63 @@ def _normalize_my_expenses_account_color(value) -> int:
     return _hex_to_android_color(value, default=-3355444)
 
 
+def _my_expenses_record_key(item: object, fields: tuple[str, ...]) -> str | None:
+    if isinstance(item, str):
+        return item
+    if not isinstance(item, dict):
+        return None
+    for field in fields:
+        value = item.get(field)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
+def _dedupe_my_expenses_records(records: list, fields: tuple[str, ...], *, prefer_latest: bool = False) -> list:
+    order: list[str] = []
+    keyed: dict[str, object] = {}
+    passthrough: list[object] = []
+    for item in records:
+        key = _my_expenses_record_key(item, fields)
+        if key is None:
+            passthrough.append(item)
+            continue
+        if key not in keyed:
+            order.append(key)
+        elif not prefer_latest:
+            continue
+        keyed[key] = item
+    return [keyed[key] for key in order] + passthrough
+
+
+def _merge_my_expenses_containers(raw) -> dict:
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, list):
+        return {}
+    merged = {"accounts": [], "categories": [], "payees": [], "transactions": []}
+    for container in raw:
+        if not isinstance(container, dict):
+            continue
+        for key in merged:
+            values = container.get(key) or []
+            if isinstance(values, list):
+                merged[key].extend(values)
+    merged["accounts"] = _dedupe_my_expenses_records(
+        merged["accounts"], ("account_id", "id", "label", "name")
+    )
+    merged["categories"] = _dedupe_my_expenses_records(
+        merged["categories"], ("category_id", "id", "label", "name")
+    )
+    merged["payees"] = _dedupe_my_expenses_records(
+        merged["payees"], ("payee_id", "id", "name")
+    )
+    merged["transactions"] = _dedupe_my_expenses_records(
+        merged["transactions"], ("transaction_id", "id"), prefer_latest=True
+    )
+    return merged
+
+
 def _normalize_my_expenses_data(raw) -> dict:
     """Convert ID-based or list-wrapped fixtures to the label-reference format
     expected by inject_my_expenses.
@@ -1141,9 +1198,11 @@ def _normalize_my_expenses_data(raw) -> dict:
     Handles three observed variants:
       1. Already-correct: dict with label/account/category fields — returned as-is.
       2. Dict with name/account_id/category_id fields (TGUI10 style).
-      3. Single-element list wrapping either of the above (most complex_tasks).
+      3. List wrapping either of the above (most complex_tasks).
     """
-    data = raw[0] if isinstance(raw, list) else raw
+    data = _merge_my_expenses_containers(raw)
+    if not isinstance(data, dict):
+        return {}
 
     accs = data.get("accounts", [])
     txs  = data.get("transactions", [])
@@ -1207,8 +1266,18 @@ def _normalize_my_expenses_data(raw) -> dict:
 
     norm_transactions = []
     for tx in txs:
-        acc_label = tx.get("account") or acc_id_to_label.get(tx.get("account_id", ""), "")
-        cat_label = tx.get("category") or cat_id_to_label.get(tx.get("category_id", ""), "")
+        raw_account = tx.get("account")
+        raw_category = tx.get("category")
+        acc_label = (
+            acc_id_to_label.get(str(raw_account), "")
+            if raw_account not in (None, "")
+            else acc_id_to_label.get(tx.get("account_id", ""), "")
+        ) or raw_account or ""
+        cat_label = (
+            cat_id_to_label.get(str(raw_category), "")
+            if raw_category not in (None, "")
+            else cat_id_to_label.get(tx.get("category_id", ""), "")
+        ) or raw_category or ""
         payee     = tx.get("payee") or payee_id_to_name.get(tx.get("payee_id", ""), "")
         comment   = tx.get("comment") or tx.get("description") or tx.get("notes", "")
         norm_transactions.append({
@@ -1218,6 +1287,7 @@ def _normalize_my_expenses_data(raw) -> dict:
             "category": cat_label,
             "payee":    payee,
             "comment":  comment,
+            "transaction_id": tx.get("transaction_id") or tx.get("id", ""),
         })
 
     return {

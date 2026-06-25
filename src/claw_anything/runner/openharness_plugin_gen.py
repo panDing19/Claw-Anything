@@ -1187,6 +1187,35 @@ def _normalize_local_gmail_clone(raw: Any) -> list[dict]:
     return messages
 
 
+def _local_record_key(item: object, fields: tuple[str, ...]) -> str | None:
+    if isinstance(item, str):
+        return item
+    if not isinstance(item, dict):
+        return None
+    for field in fields:
+        value = item.get(field)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
+def _dedupe_local_records(records: list, fields: tuple[str, ...], *, prefer_latest: bool = False) -> list:
+    order: list[str] = []
+    keyed: dict[str, object] = {}
+    passthrough: list[object] = []
+    for item in records:
+        key = _local_record_key(item, fields)
+        if key is None:
+            passthrough.append(item)
+            continue
+        if key not in keyed:
+            order.append(key)
+        elif not prefer_latest:
+            continue
+        keyed[key] = item
+    return [keyed[key] for key in order] + passthrough
+
+
 def _normalize_local_my_expenses(raw: Any) -> dict[str, Any]:
     data = {"accounts": [], "categories": [], "payees": [], "transactions": []}
     containers = raw if isinstance(raw, list) else [raw] if isinstance(raw, dict) else []
@@ -1209,7 +1238,7 @@ def _normalize_local_my_expenses(raw: Any) -> dict[str, Any]:
         raw_id = account.get("account_id") or account.get("id") or account.get("name") or f"ACC-{index + 1}"
         account["account_id"] = str(raw_id)
         accounts.append(account)
-    data["accounts"] = accounts
+    data["accounts"] = _dedupe_local_records(accounts, ("account_id", "id", "label", "name"))
 
     categories = []
     for index, item in enumerate(_as_list(data.get("categories"))):
@@ -1219,15 +1248,15 @@ def _normalize_local_my_expenses(raw: Any) -> dict[str, Any]:
         raw_id = category.get("category_id") or category.get("id") or category.get("name") or f"CAT-{index + 1}"
         category["category_id"] = str(raw_id)
         categories.append(category)
-    data["categories"] = categories
+    data["categories"] = _dedupe_local_records(categories, ("category_id", "id", "label", "name"))
 
     account_names = {
         str(account.get("account_id") or ""): account.get("name") or account.get("label") or ""
-        for account in accounts
+        for account in data["accounts"]
     }
     category_names = {
         str(category.get("category_id") or ""): category.get("name") or category.get("label") or ""
-        for category in categories
+        for category in data["categories"]
     }
 
     transactions = []
@@ -1240,15 +1269,21 @@ def _normalize_local_my_expenses(raw: Any) -> dict[str, Any]:
         account_id = txn.get("account_id") or txn.get("account")
         if account_id is not None:
             txn["account_id"] = str(account_id)
-            if not txn.get("account"):
+            if str(txn.get("account") or "") in account_names:
+                txn["account"] = account_names[str(txn.get("account"))]
+            elif not txn.get("account"):
                 txn["account"] = account_names.get(str(account_id), "")
         category_id = txn.get("category_id") or txn.get("category")
         if category_id is not None:
             txn["category_id"] = str(category_id)
-            if not txn.get("category"):
+            if str(txn.get("category") or "") in category_names:
+                txn["category"] = category_names[str(txn.get("category"))]
+            elif not txn.get("category"):
                 txn["category"] = category_names.get(str(category_id), "")
         transactions.append(txn)
-    data["transactions"] = transactions
+    data["transactions"] = _dedupe_local_records(
+        transactions, ("transaction_id", "id"), prefer_latest=True
+    )
     payees = []
     seen_payees = set()
     for payee in data.get("payees") or []:
