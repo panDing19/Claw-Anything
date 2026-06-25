@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from typing import Any
 
 from ..models.task import TaskDefinition
 
@@ -220,6 +221,23 @@ def _make_tool_class(
         async def execute(self, arguments: BaseModel, context: ToolExecutionContext) -> ToolResult:
             payload = arguments.model_dump()
             t0 = time.monotonic()
+            local_result = _handle_local_gui_tool(tool_name, payload)
+            if local_result is not None:
+                status, body = local_result
+                latency_ms = (time.monotonic() - t0) * 1000.0
+                _emit_dispatch({
+                    "tool_name": tool_name,
+                    "endpoint_url": "local://gui/" + tool_name,
+                    "request_body": payload,
+                    "response_status": status,
+                    "response_body": body,
+                    "latency_ms": latency_ms,
+                    "timestamp": time.time(),
+                })
+                return ToolResult(
+                    output=json.dumps(body, ensure_ascii=False),
+                    is_error=status >= 400,
+                )
             try:
                 async with httpx.AsyncClient(timeout=30.0, trust_env=False) as cli:
                     resp = await cli.request(method=method, url=endpoint_url, json=payload)
@@ -262,6 +280,333 @@ def _make_tool_class(
 
 # --- Per-task tool registrations ---
 '''
+
+
+_LOCAL_GUI_HELPERS = r'''
+
+_LOCAL_GUI_STATE: dict[str, Any] = {}
+
+
+def _text_match(query: Any, *values: Any) -> bool:
+    q = str(query or "").strip().lower()
+    if not q:
+        return True
+    return any(q in str(value or "").lower() for value in values)
+
+
+def _handle_fossify_messages(tool_name: str, payload: dict) -> tuple[int, Any]:
+    state = _LOCAL_GUI_STATE.setdefault("fossify_messages", {})
+    threads = state.setdefault("threads", [])
+    sent = state.setdefault("sent_messages", [])
+
+    if tool_name.endswith("_list_threads"):
+        query = payload.get("query")
+        unread_only = bool(payload.get("unread_only", False))
+        max_results = int(payload.get("max_results") or 50)
+        matches = []
+        for thread in threads:
+            messages = thread.get("messages") or []
+            haystack = [
+                thread.get("thread_id"),
+                thread.get("contact_name"),
+                thread.get("last_message"),
+                " ".join(thread.get("participants") or []),
+                " ".join(str(msg.get("text") or "") for msg in messages[-5:]),
+            ]
+            if not _text_match(query, *haystack):
+                continue
+            if unread_only and int(thread.get("unread_count") or 0) <= 0:
+                continue
+            matches.append({
+                "thread_id": thread.get("thread_id"),
+                "contact_name": thread.get("contact_name"),
+                "participants": thread.get("participants") or [],
+                "last_message": thread.get("last_message"),
+                "last_message_time": thread.get("last_message_time"),
+                "unread_count": int(thread.get("unread_count") or 0),
+                "pinned": bool(thread.get("pinned", False)),
+                "archived": bool(thread.get("archived", False)),
+            })
+        return 200, {"threads": matches[:max_results], "total": len(matches), "returned": min(len(matches), max_results)}
+
+    if tool_name.endswith("_get_thread"):
+        thread_id = payload.get("thread_id")
+        for thread in threads:
+            if thread.get("thread_id") == thread_id:
+                return 200, thread
+        return 404, {"error": f"Thread not found: {thread_id}"}
+
+    if tool_name.endswith("_send_message"):
+        text = str(payload.get("text") or payload.get("message") or "")
+        if not text.strip():
+            return 400, {"error": "text is required"}
+        thread_id = payload.get("thread_id")
+        phone_number = payload.get("phone_number")
+        target = None
+        for thread in threads:
+            if thread_id and thread.get("thread_id") == thread_id:
+                target = thread
+                break
+            if phone_number and phone_number in (thread.get("participants") or []):
+                target = thread
+                break
+        if target is None:
+            thread_id = thread_id or f"FSMS-LOCAL-{len(threads) + 1}"
+            target = {
+                "thread_id": thread_id,
+                "contact_name": phone_number or "Unknown",
+                "participants": [phone_number] if phone_number else [],
+                "messages": [],
+                "unread_count": 0,
+                "pinned": False,
+                "archived": False,
+            }
+            threads.append(target)
+        message_id = f"LOCAL-SENT-{len(sent) + 1}"
+        msg = {
+            "id": message_id,
+            "from": "me",
+            "text": text,
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
+            "is_outgoing": True,
+            "is_read": True,
+        }
+        target.setdefault("messages", []).append(msg)
+        target["last_message"] = text
+        target["last_message_time"] = msg["time"]
+        record = {
+            "message_id": message_id,
+            "thread_id": target.get("thread_id"),
+            "phone_number": phone_number,
+            "text": text,
+            "status": "sent",
+        }
+        sent.append(record)
+        return 200, record
+
+    if tool_name.endswith("_mark_thread"):
+        thread_id = payload.get("thread_id")
+        for thread in threads:
+            if thread.get("thread_id") == thread_id:
+                if "read" in payload:
+                    thread["unread_count"] = 0 if payload.get("read") else thread.get("unread_count", 0)
+                if "archived" in payload:
+                    thread["archived"] = bool(payload.get("archived"))
+                if "pinned" in payload:
+                    thread["pinned"] = bool(payload.get("pinned"))
+                return 200, {"status": "updated", "thread_id": thread_id}
+        return 404, {"error": f"Thread not found: {thread_id}"}
+
+    return 404, {"error": f"Unsupported Fossify Messages tool: {tool_name}"}
+
+
+def _handle_fossify_notes(tool_name: str, payload: dict) -> tuple[int, Any]:
+    state = _LOCAL_GUI_STATE.setdefault("fossify_notes", {})
+    notes = state.setdefault("notes", [])
+
+    if tool_name.endswith("_list_notes"):
+        query = payload.get("query")
+        tag = str(payload.get("tag") or "").strip().lower()
+        max_results = int(payload.get("max_results") or 50)
+        matches = []
+        for note in notes:
+            tags = note.get("tags") or []
+            if tag and tag not in [str(t).lower() for t in tags]:
+                continue
+            if not _text_match(query, note.get("title"), note.get("content"), " ".join(tags)):
+                continue
+            matches.append({
+                "note_id": note.get("note_id"),
+                "title": note.get("title"),
+                "updated_at": note.get("updated_at"),
+                "tags": tags,
+                "pinned": bool(note.get("pinned", False)),
+            })
+        return 200, {"notes": matches[:max_results], "total": len(matches), "returned": min(len(matches), max_results)}
+
+    if tool_name.endswith("_get_note"):
+        note_id = payload.get("note_id")
+        for note in notes:
+            if note.get("note_id") == note_id:
+                return 200, note
+        return 404, {"error": f"Note not found: {note_id}"}
+
+    if tool_name.endswith("_create_note"):
+        title = str(payload.get("title") or "").strip()
+        content = str(payload.get("content") or "")
+        if not title or not content:
+            return 400, {"error": "title and content are required"}
+        note_id = f"FNOT-LOCAL-{len(notes) + 1}"
+        note = {
+            "note_id": note_id,
+            "title": title,
+            "content": content,
+            "color": payload.get("color"),
+            "tags": payload.get("tags") or [],
+            "checklist": bool(payload.get("checklist", False)),
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
+        }
+        notes.append(note)
+        return 200, {"status": "created", **note}
+
+    if tool_name.endswith("_update_note"):
+        note_id = payload.get("note_id")
+        for note in notes:
+            if note.get("note_id") == note_id:
+                for key in ("title", "content", "color", "tags"):
+                    if key in payload:
+                        note[key] = payload[key]
+                note["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+                return 200, {"status": "updated", "note_id": note_id}
+        return 404, {"error": f"Note not found: {note_id}"}
+
+    return 404, {"error": f"Unsupported Fossify Notes tool: {tool_name}"}
+
+
+def _handle_local_gui_tool(tool_name: str, payload: dict) -> tuple[int, Any] | None:
+    if tool_name.startswith("fossify_messages"):
+        return _handle_fossify_messages(tool_name, payload)
+    if tool_name.startswith("fossify_notes"):
+        return _handle_fossify_notes(tool_name, payload)
+    return None
+'''
+
+
+def _message_text(item: dict) -> str:
+    return str(
+        item.get("text")
+        or item.get("message_text")
+        or item.get("content")
+        or item.get("body")
+        or ""
+    )
+
+
+def _message_time(item: dict) -> str:
+    return str(item.get("time") or item.get("timestamp") or item.get("date") or "")
+
+
+def _message_outgoing(item: dict) -> bool:
+    if "is_outgoing" in item:
+        return bool(item.get("is_outgoing"))
+    if "is_sent" in item:
+        return bool(item.get("is_sent"))
+    return str(item.get("sender") or item.get("from") or "").lower() == "me"
+
+
+def _normalize_local_message(item: dict) -> dict:
+    sender = item.get("from") or item.get("sender")
+    if sender == "contact":
+        sender = item.get("contact_number") or "contact"
+    return {
+        "id": str(item.get("id") or item.get("message_id") or ""),
+        "from": sender or ("me" if _message_outgoing(item) else "contact"),
+        "text": _message_text(item),
+        "time": _message_time(item),
+        "is_outgoing": _message_outgoing(item),
+        "is_read": bool(item.get("is_read", True)),
+    }
+
+
+def _normalize_local_fossify_messages(raw: Any) -> list[dict]:
+    grouped: dict[str, dict] = {}
+    for index, item in enumerate(raw if isinstance(raw, list) else []):
+        if not isinstance(item, dict):
+            continue
+        thread_id = str(item.get("thread_id") or item.get("id") or f"thread-{index + 1}")
+        thread = grouped.setdefault(
+            thread_id,
+            {
+                "thread_id": thread_id,
+                "contact_name": item.get("contact_name") or item.get("name") or "",
+                "participants": list(item.get("participants") or []),
+                "messages": [],
+                "unread_count": int(item.get("unread_count") or 0),
+                "pinned": bool(item.get("pinned", False)),
+                "archived": bool(item.get("archived", item.get("is_archived", False))),
+            },
+        )
+        if item.get("contact_name") and not thread.get("contact_name"):
+            thread["contact_name"] = item.get("contact_name")
+        contact_number = item.get("contact_number") or item.get("phone_number")
+        if contact_number and contact_number not in thread["participants"]:
+            thread["participants"].append(contact_number)
+
+        messages = item.get("messages")
+        if isinstance(messages, list):
+            for msg in messages:
+                if isinstance(msg, dict):
+                    thread["messages"].append(_normalize_local_message(msg))
+        else:
+            thread["messages"].append(_normalize_local_message(item))
+
+        explicit_last = item.get("last_message") or item.get("last_message_preview")
+        if explicit_last:
+            thread["last_message"] = explicit_last
+        explicit_time = item.get("last_message_time") or item.get("last_updated")
+        if explicit_time:
+            thread["last_message_time"] = explicit_time
+
+    for thread in grouped.values():
+        messages = thread.get("messages") or []
+        if messages:
+            last = messages[-1]
+            thread.setdefault("last_message", last.get("text"))
+            thread.setdefault("last_message_time", last.get("time"))
+        thread["messages"] = messages
+    return list(grouped.values())
+
+
+def _normalize_local_fossify_notes(raw: Any) -> list[dict]:
+    notes: list[dict] = []
+    for index, item in enumerate(raw if isinstance(raw, list) else []):
+        if not isinstance(item, dict):
+            continue
+        raw_id = item.get("note_id") or item.get("id") or index + 1
+        note_id = str(raw_id if str(raw_id).startswith("FNOT-") else f"FNOT-{raw_id}")
+        notes.append(
+            {
+                "note_id": note_id,
+                "title": item.get("title") or "",
+                "content": item.get("content") or "",
+                "color": item.get("color"),
+                "tags": item.get("tags") or [],
+                "pinned": bool(item.get("pinned", False)),
+                "updated_at": item.get("updated_at") or item.get("timestamp") or item.get("last_updated") or "",
+            }
+        )
+    return notes
+
+
+def _build_local_gui_state(task: TaskDefinition) -> dict[str, Any]:
+    """Embed GUI fixtures for task-declared semantic GUI tools.
+
+    ``/gui/...`` endpoints are not real mock services in trial containers. The
+    generated OH plugin serves the small semantic subset directly from fixture
+    state so GUI task tools are reachable after host-side Android injection.
+    """
+    if not task.task_file:
+        return {}
+    task_dir = Path(task.task_file).parent
+    state: dict[str, Any] = {}
+    for fixture in task.environment.fixtures:
+        path = task_dir / fixture
+        if not path.exists():
+            continue
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if "fossify_messages_gui" in fixture:
+            state["fossify_messages"] = {
+                "threads": _normalize_local_fossify_messages(raw),
+                "sent_messages": [],
+            }
+        elif "fossify_notes_gui" in fixture:
+            state["fossify_notes"] = {
+                "notes": _normalize_local_fossify_notes(raw),
+            }
+    return state
 
 
 def _safe_attr_name(tool_name: str) -> str:
@@ -390,7 +735,14 @@ def _render_skill_mode_get_tool_schema(task: TaskDefinition) -> str:
 def _render_generated_tools(task: TaskDefinition, skill_mode: bool = False) -> str:
     """Render the full tools/clawanything_tools.py source for a task."""
     endpoints = task.get_endpoint_map()
-    lines = [_GENERATED_HEADER]
+    local_gui_state = _build_local_gui_state(task)
+    lines = [
+        _GENERATED_HEADER,
+        _LOCAL_GUI_HELPERS,
+        "\n_LOCAL_GUI_STATE = ",
+        repr(local_gui_state),
+        "\n\n",
+    ]
     if skill_mode:
         lines.append(_render_skill_mode_get_tool_schema(task))
     for spec in task.tools:

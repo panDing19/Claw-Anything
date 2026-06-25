@@ -6,6 +6,9 @@ from pathlib import Path
 
 import pytest
 
+from claw_anything.models.task import TaskDefinition
+from claw_anything.runner.openharness_plugin_gen import _build_local_gui_state
+
 
 gui_init = importlib.import_module("claw_anything.task.mobile_gui.init_gui_task")
 
@@ -97,3 +100,39 @@ def test_shadow_app_state_falls_back_when_package_is_missing(tmp_path, monkeypat
         )
     ]
     assert "rm -f /data/local/tmp/claw_gui_state/com.testmall.app/state.json" in shells
+
+
+def test_fossify_messages_normalizes_mixed_tgui46_fixture() -> None:
+    fixture = (
+        Path(__file__).resolve().parents[1]
+        / "benchmark/gui/TGUI46_job_failure_triage_workmail_sms_notes"
+        / "fixtures/gui/fossify_messages_gui/threads.json"
+    )
+    raw = json.loads(fixture.read_text(encoding="utf-8"))
+
+    threads = gui_init._normalize_fossify_messages(raw)
+
+    assert len(threads) >= 3
+    assert all(thread["participants"] for thread in threads if thread["messages"])
+    assert all(msg["text"] for thread in threads for msg in thread["messages"])
+    assert any("JOB-" in msg["text"] for thread in threads for msg in thread["messages"])
+
+
+def test_tgui46_openharness_plugin_embeds_gui_fixture_state() -> None:
+    task_yaml = (
+        Path(__file__).resolve().parents[1]
+        / "benchmark/gui/TGUI46_job_failure_triage_workmail_sms_notes/task.yaml"
+    )
+    task = TaskDefinition.from_yaml(task_yaml)
+
+    state = _build_local_gui_state(task)
+
+    threads = state["fossify_messages"]["threads"]
+    notes = state["fossify_notes"]["notes"]
+    assert any(thread["thread_id"] == "FSMS-317" for thread in threads)
+    assert any(
+        thread["contact_name"] == "CTO - Wang Ming"
+        and "connection pool" in (thread.get("last_message") or "").lower()
+        for thread in threads
+    )
+    assert any(note["note_id"] == "FNOT-221" for note in notes)
