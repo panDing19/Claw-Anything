@@ -26,6 +26,22 @@ from ..config import ContainerConfig
 
 _LOCALHOST_RE = re.compile(r"(https?://)(?:localhost|127\.0\.0\.1)(:\d+)")
 _ADB_SERIAL_RE = re.compile(r"(?:localhost|127\.0\.0\.1):(\d+)")
+_OH_NETWORK_ERROR_MARKERS = (
+    "[oh-network]",
+    "network error",
+    "incomplete chunked read",
+    "peer closed connection",
+    "server disconnected",
+    "remote protocol",
+    "connection reset",
+    "connection aborted",
+    "transport error",
+)
+
+
+def _line_contains_oh_network_error(line: str) -> bool:
+    lower = line.lower()
+    return any(marker in lower for marker in _OH_NETWORK_ERROR_MARKERS)
 
 
 # --------------------------------------------------------------------------- #
@@ -71,10 +87,10 @@ def _rewrite_oh_settings_for_container(settings: dict) -> dict:
     if "adb_path" in mg:
         mg["adb_path"] = "/usr/local/bin/adb"
     gb = mg.get("gui_backend", {})
-    if "base_url" in gb:
+    if isinstance(gb.get("base_url"), str):
         gb["base_url"] = _LOCALHOST_RE.sub(r"\1host.docker.internal\2", gb["base_url"])
     for prof in s.get("profiles", {}).values():
-        if "base_url" in prof:
+        if isinstance(prof.get("base_url"), str):
             prof["base_url"] = _LOCALHOST_RE.sub(r"\1host.docker.internal\2", prof["base_url"])
     return s
 
@@ -154,7 +170,92 @@ def _prepare_oh_settings_for_container(
     return dest
 
 
+def _oh_settings_uses_codex_subscription(settings_path: Path) -> bool:
+    """True when the active OpenHarness profile uses Codex subscription auth."""
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    active = str(settings.get("active_profile") or "").strip()
+    profiles = settings.get("profiles")
+    profile = profiles.get(active) if isinstance(profiles, dict) else None
+    if not isinstance(profile, dict):
+        return False
+    return (
+        str(profile.get("provider") or "").strip() == "openai_codex"
+        or str(profile.get("auth_source") or "").strip() == "codex_subscription"
+    )
+
+
+def _prepare_codex_subscription_auth_for_container(dest_dir: Path) -> Path | None:
+    """Create a container-local OH credentials pointer for Codex subscription auth.
+
+    OpenHarness stores subscription bindings in its own credentials file, but
+    the actual Codex token stays in ``~/.codex/auth.json``. The trial container
+    cannot see either by default because it runs with ``HOME=/tmp``. Return the
+    host Codex auth file plus a generated read-only OpenHarness config dir that
+    points at the container mount path. The token file itself is mounted
+    directly from the host and is not copied into traces.
+    """
+    host_codex_home = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
+    host_auth = host_codex_home / "auth.json"
+    if not host_auth.exists():
+        return None
+
+    oh_config_dir = dest_dir / "oh_cfg"
+    oh_config_dir.mkdir(parents=True, exist_ok=True)
+    credentials = {
+        "openai_codex": {
+            "external_binding": {
+                "provider": "openai_codex",
+                "source_path": "/tmp/codex-auth.json",
+                "source_kind": "codex_auth_json",
+                "managed_by": "codex-cli",
+                "profile_label": "Codex CLI",
+            }
+        }
+    }
+    (oh_config_dir / "credentials.json").write_text(
+        json.dumps(credentials, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return host_auth
+
+
+def _proxy_env_for_container() -> dict[str, str]:
+    """Return proxy env vars rewritten for Docker-to-host reachability."""
+    result: dict[str, str] = {}
+    rewrite_localhost = os.environ.get("CLAW_DOCKER_NETWORK") != "host"
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
+        value = os.environ.get(name)
+        if value:
+            result[name] = (
+                _LOCALHOST_RE.sub(r"\1host.docker.internal\2", value)
+                if rewrite_localhost
+                else value
+            )
+
+    no_proxy_raw = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+    entries = [p.strip() for p in no_proxy_raw.split(",") if p.strip()]
+    for required in ("localhost", "127.0.0.1", "::1", "host.docker.internal"):
+        if required not in entries:
+            entries.append(required)
+    no_proxy = ",".join(entries)
+    result["NO_PROXY"] = no_proxy
+    result["no_proxy"] = no_proxy
+    return result
+
+
 CONTAINER_LABEL = "app=claw-anything"
+OPENHARNESS_PATCH_MOUNT = "/opt/claw-openharness-patches"
+
+
+def _openharness_runtime_patch_dir() -> Path | None:
+    """Host-side Python startup patches to inject into OH trial containers."""
+    patch_dir = Path(__file__).resolve().parent / "patches" / "openharness_codex_retry"
+    if (patch_dir / "sitecustomize.py").exists():
+        return patch_dir
+    return None
 
 
 @dataclass(frozen=True)
@@ -250,6 +351,7 @@ def run_trial_in_container(
     # --oh-disable-builtin-tools guard further down.
     _OH_AGENTS = ("openharness", "openharness-ext")
     use_oh_settings = bool(oh_settings_path) and agent in _OH_AGENTS
+    oh_patch_dir = _openharness_runtime_patch_dir() if agent in _OH_AGENTS else None
 
     # Vanilla openharness has no GUI/Android plugin and the claw-anything-oh
     # image ships no ``adb`` binary, so a device_serial passed for that agent
@@ -274,6 +376,9 @@ def run_trial_in_container(
         cmd += ["--memory", str(container_cfg.memory_limit)]
     if container_cfg.cpu_limit:
         cmd += ["--cpus", str(container_cfg.cpu_limit)]
+    docker_network = os.environ.get("CLAW_DOCKER_NETWORK")
+    if docker_network:
+        cmd += ["--network", docker_network]
 
     # ── Volume mounts ────────────────────────────────────────────────────────
     # Mount the per-trial task snapshot at /opt/claw-anything/tasks/{task_id}/
@@ -296,6 +401,8 @@ def run_trial_in_container(
     # is_inside_trial_container() — so /workspace is hard-wired to this mount,
     # no extra CLI flag / env var needed.
     cmd += ["-v", f"{workspace_dir}:/workspace"]
+    if oh_patch_dir is not None:
+        cmd += ["-v", f"{oh_patch_dir}:{OPENHARNESS_PATCH_MOUNT}:ro"]
     if config_path:
         # Rewrite localhost URLs so the container's judge/model reach host-side
         # inference via host.docker.internal, and pin the allocated device as
@@ -324,6 +431,16 @@ def run_trial_in_container(
         )
         print(f"[{tag}] oh-settings patched for container: {settings_copy}")
         cmd += ["-v", f"{settings_copy}:/etc/oh-settings.json:ro"]
+        if _oh_settings_uses_codex_subscription(settings_copy):
+            codex_auth = _prepare_codex_subscription_auth_for_container(task_out)
+            if codex_auth is None:
+                print(
+                    f"[{tag}] WARN: oh-settings uses Codex subscription, "
+                    "but ~/.codex/auth.json was not found on the host.",
+                    flush=True,
+                )
+            else:
+                cmd += ["-v", f"{codex_auth}:/tmp/codex-auth.json:ro"]
         if task_out != trace_dir:
             shutil.copyfile(settings_copy, trace_dir / "oh-settings.json")
 
@@ -343,11 +460,21 @@ def run_trial_in_container(
     # Redirect LLM call logs to the mounted /out volume so the container user
     # (non-root) can write them; the default /opt/llm_logs is root-owned.
     cmd += ["-e", "CLAW_ANYTHING_LLM_LOG_DIR=/out/llm_logs"]
+    # OH/OpenAI-compatible providers can resolve credentials from the process
+    # environment; pass only variables already present on the host process so
+    # users can keep API keys out of config files.
+    for api_env in ("OPENAI_API_KEY", "OPENROUTER_API_KEY"):
+        if os.environ.get(api_env):
+            cmd += ["-e", api_env]
+    for name, value in _proxy_env_for_container().items():
+        cmd += ["-e", f"{name}={value}"]
     # Force unbuffered stdout/stderr so the inner claw-anything's logs stream to the
     # host in real time. Without this, Python block-buffers when stdout is a
     # pipe (not a TTY), so progress is invisible until the process exits and
     # the run looks hung even while it is working.
     cmd += ["-e", "PYTHONUNBUFFERED=1"]
+    if oh_patch_dir is not None:
+        cmd += ["-e", f"PYTHONPATH={OPENHARNESS_PATCH_MOUNT}"]
     # Positive "I am the inner stage" marker. The inner claw-anything is launched
     # WITHOUT --trial-in-container, but absence of that flag is ambiguous (a
     # plain standalone run also lacks it). This env var is the unambiguous
@@ -398,9 +525,12 @@ def run_trial_in_container(
         bufsize=1,
     )
 
+    oh_network_error_seen = False
     try:
         assert proc.stdout is not None
         for line in proc.stdout:
+            if _line_contains_oh_network_error(line):
+                oh_network_error_seen = True
             print(f"[{tag}] {line}", end="", flush=True)
     finally:
         try:
@@ -410,8 +540,9 @@ def run_trial_in_container(
             proc.wait(timeout=10)
 
     if proc.returncode != 0:
+        prefix = "[oh-network] " if oh_network_error_seen else ""
         raise RuntimeError(
-            f"Container exited with code {proc.returncode}. "
+            f"{prefix}Container exited with code {proc.returncode}. "
             f"Check [{tag}] output above for details."
         )
 

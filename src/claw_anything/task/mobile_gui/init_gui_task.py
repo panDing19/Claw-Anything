@@ -112,11 +112,31 @@ def _adb_prefix(device: str | None) -> list[str]:
     return [_ADB, "-s", device] if device else [_ADB]
 
 
+def _wait_for_device(device: str | None = None, timeout_s: float = 30.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        res = subprocess.run(
+            _adb_prefix(device) + ["get-state"],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode == 0 and res.stdout.strip() == "device":
+            return True
+        time.sleep(1)
+    return False
+
+
 def _run(cmd: list[str], root_required: bool = False, device: str | None = None) -> tuple[bool, str]:
+    if not _wait_for_device(device):
+        return False, "adb device not ready"
     if root_required:
         check = subprocess.run(_adb_prefix(device) + ["shell", "whoami"], capture_output=True, text=True)
         if check.returncode == 0 and check.stdout.strip() != "root":
             subprocess.run(_adb_prefix(device) + ["root"], capture_output=True, text=True)
+            if not _wait_for_device(device):
+                return False, "adb device not ready after adb root"
+    if not _wait_for_device(device):
+        return False, "adb device not ready"
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result.returncode == 0, (result.stdout + result.stderr).strip()
 
@@ -177,6 +197,9 @@ def _start_package_launcher(
 
 def _capture_screenshot(task_id: str, screenshots_dir: Path, name: str, device: str | None = None) -> None:
     shot_path = screenshots_dir / name
+    if not _wait_for_device(device):
+        print(f"[{task_id}] Screenshot failed: {name}", file=sys.stderr)
+        return
     result = subprocess.run(_adb_prefix(device) + ["exec-out", "screencap", "-p"], capture_output=True)
     if result.returncode == 0 and result.stdout:
         shot_path.write_bytes(result.stdout)

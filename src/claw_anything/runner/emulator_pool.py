@@ -38,6 +38,7 @@ References:
 from __future__ import annotations
 
 import concurrent.futures
+import os
 import shlex
 import socket
 import subprocess
@@ -90,6 +91,7 @@ class _Instance:
     container_name: str
     host_port: int
     serial: str  # e.g. "localhost:32772"
+    network_mode: str | None = None
 
 
 @dataclass
@@ -174,6 +176,12 @@ class EmulatorPool:
 
         if self.size <= 0:
             return []
+        emulator_network = (os.environ.get("CLAW_EMULATOR_NETWORK") or "").strip()
+        if emulator_network == "host" and self.size > 1:
+            raise RuntimeError(
+                "CLAW_EMULATOR_NETWORK=host only supports one KVM emulator at a time "
+                "because the Android emulator binds fixed host ports 5554/5555."
+            )
 
         print(f"[emu-pool] starting {self.size} emulator container(s) from {self.image}")
 
@@ -227,8 +235,12 @@ class EmulatorPool:
             "--rm",
             "--label", EMU_CONTAINER_LABEL,
             "--name", name,
-            "-p", f"{host_port}:{self.container_adb_port}",
         ]
+        network_mode = (os.environ.get("CLAW_EMULATOR_NETWORK") or "").strip()
+        if network_mode:
+            cmd += ["--network", network_mode]
+        else:
+            cmd += ["-p", f"{host_port}:{self.container_adb_port}"]
         if self.privileged:
             cmd.append("--privileged")
         if self.kvm:
@@ -256,7 +268,8 @@ class EmulatorPool:
         return _Instance(
             container_name=name,
             host_port=host_port,
-            serial=f"localhost:{host_port}",
+            serial=_INNER_ADB_SERIAL if network_mode == "host" else f"localhost:{host_port}",
+            network_mode=network_mode or None,
         )
 
     # ── boot probe ─────────────────────────────────────────────────────────
@@ -269,8 +282,12 @@ class EmulatorPool:
             print(f"[emu-pool] booted: {inst.serial} ({inst.container_name})")
             # Bridge the 127.0.0.1-bound qemu adb out to the published port,
             # then confirm the host's adb can actually reach the device — that
-            # host-reachable serial is what workers / inject consume.
-            self._expose_adb(inst)
+            # host-reachable serial is what workers / inject consume. In host
+            # network mode qemu already binds in the host namespace, so the
+            # normal emulator serial is directly visible and no bridge is
+            # needed.
+            if inst.network_mode != "host":
+                self._expose_adb(inst)
             self._host_connect(inst)
             print(f"[emu-pool] adb reachable: {inst.serial} ({inst.container_name})")
 
@@ -330,8 +347,10 @@ class EmulatorPool:
         adb = resolve_adb_bin(None)
         deadline = time.monotonic() + self.boot_timeout_s
         last = ""
+        tcp_serial = bool(inst.serial.rsplit(":", 1)[-1].isdigit() and ":" in inst.serial)
         while time.monotonic() < deadline:
-            subprocess.run([adb, "connect", inst.serial], capture_output=True, text=True)
+            if tcp_serial:
+                subprocess.run([adb, "connect", inst.serial], capture_output=True, text=True)
             res = subprocess.run(
                 [adb, "-s", inst.serial, "get-state"],
                 capture_output=True, text=True,
@@ -339,7 +358,8 @@ class EmulatorPool:
             last = (res.stdout + res.stderr).strip()
             if res.returncode == 0 and last == "device":
                 return
-            subprocess.run([adb, "disconnect", inst.serial], capture_output=True, text=True)
+            if tcp_serial:
+                subprocess.run([adb, "disconnect", inst.serial], capture_output=True, text=True)
             time.sleep(2)
         raise TimeoutError(
             f"[emu-pool] host adb could not reach {inst.serial} "

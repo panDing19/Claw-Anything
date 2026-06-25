@@ -82,6 +82,17 @@ _DEFAULT_TASK_TIMEOUT_S = 1200
 #: subprocess is force-killed.
 _OH_SHUTDOWN_GRACE_S = 60
 
+_OH_NETWORK_ERROR_MARKERS = (
+    "network error",
+    "incomplete chunked read",
+    "peer closed connection",
+    "server disconnected",
+    "remote protocol",
+    "connection reset",
+    "connection aborted",
+    "transport error",
+)
+
 
 def _log(msg: str) -> None:
     """Print a log line and flush immediately.
@@ -237,6 +248,21 @@ def _brief_args(d: Any, max_len: int = 80) -> str:
     except Exception:
         s = str(d)
     return s if len(s) <= max_len else s[:max_len] + "..."
+
+
+def _is_oh_network_error(message: str) -> bool:
+    msg = message.lower()
+    return any(marker in msg for marker in _OH_NETWORK_ERROR_MARKERS)
+
+
+def _first_oh_network_error(events: list[dict]) -> str | None:
+    for ev in events:
+        if ev.get("type") != "error":
+            continue
+        message = str(ev.get("message", ""))
+        if _is_oh_network_error(message):
+            return message
+    return None
 
 
 class _OHStreamPrinter:
@@ -507,6 +533,9 @@ class OpenHarnessAgent(BaseAgent):
             dispatch_log=cfg_root / "dispatch.jsonl",
             return_code=return_code,
         )
+        network_error = _first_oh_network_error(oh_events)
+        if network_error:
+            raise RuntimeError(f"[oh-network] {network_error[:500]}")
 
     # ------------------------------------------------------------------ #
     #  Step 1 — config dir + generated plugin                             #
@@ -538,8 +567,69 @@ class OpenHarnessAgent(BaseAgent):
             skill_mode=skill_mode,
             print_mode_extra_fields=self.print_mode_extra_fields() or None,
         )
+        self._materialize_subscription_credentials(cfg_root)
         _log(f"{self.LOG_PREFIX} config dir: {cfg_root}")
         return cfg_root
+
+    def _materialize_subscription_credentials(self, cfg_root: Path) -> None:
+        """Copy external subscription bindings into the per-trial OH config dir.
+
+        ``oh`` is launched with ``OPENHARNESS_CONFIG_DIR=<trial>/oh_cfg`` so it
+        cannot see the user's global ``~/.openharness/credentials.json``. API
+        key profiles usually carry credentials in settings/env, but subscription
+        profiles need an external binding entry. For Codex, keep the real token
+        in the Codex auth file and write only a pointer into ``oh_cfg``.
+        """
+        settings_path = cfg_root / "settings.json"
+        try:
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+
+        active = str(settings.get("active_profile") or "").strip()
+        profiles = settings.get("profiles")
+        profile = profiles.get(active) if isinstance(profiles, dict) else None
+        if not isinstance(profile, dict):
+            return
+        uses_codex = (
+            str(profile.get("provider") or "").strip() == "openai_codex"
+            or str(profile.get("auth_source") or "").strip() == "codex_subscription"
+        )
+        if not uses_codex:
+            return
+
+        container_auth = Path("/tmp/codex-auth.json")
+        if container_auth.exists():
+            auth_path = container_auth
+        else:
+            auth_path = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser() / "auth.json"
+        if not auth_path.exists():
+            _log(
+                f"{self.LOG_PREFIX} WARN: Codex subscription selected, "
+                f"but auth file was not found at {auth_path}"
+            )
+            return
+
+        credentials = {
+            "openai_codex": {
+                "external_binding": {
+                    "provider": "openai_codex",
+                    "source_path": str(auth_path),
+                    "source_kind": "codex_auth_json",
+                    "managed_by": "codex-cli",
+                    "profile_label": "Codex CLI",
+                }
+            }
+        }
+        credentials_path = cfg_root / "credentials.json"
+        credentials_path.write_text(
+            json.dumps(credentials, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        try:
+            credentials_path.chmod(0o600)
+        except OSError:
+            pass
 
     def _build_oh_env(
         self, task: TaskDefinition, cfg_root: Path,

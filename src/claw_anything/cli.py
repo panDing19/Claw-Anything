@@ -1035,6 +1035,66 @@ def _write_openai_trace(
     return openai_path
 
 
+_OH_NETWORK_ERROR_MARKERS = (
+    "[oh-network]",
+    "network error",
+    "incomplete chunked read",
+    "peer closed connection",
+    "server disconnected",
+    "remote protocol",
+    "connection reset",
+    "connection aborted",
+    "transport error",
+)
+
+
+def _contains_oh_network_error(text: str) -> bool:
+    lower = text.lower()
+    return any(marker in lower for marker in _OH_NETWORK_ERROR_MARKERS)
+
+
+def _trace_has_oh_network_error(trace_path: Path) -> bool:
+    """Best-effort filter for OpenHarness transport failures.
+
+    New network failures raise before grading, so they normally will not reach
+    the continue scanner. This also catches older traces produced before that
+    guard existed, where OH emitted a stream-json error but exited 0.
+    """
+    try:
+        with open(trace_path, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                for failure in ev.get("failure_modes", []) or []:
+                    if _contains_oh_network_error(str(failure)):
+                        return True
+    except OSError:
+        return False
+
+    for sidecar in (
+        trace_path.parent / "oh_cfg" / "oh_stream.jsonl",
+        trace_path.parent / "oh_cfg" / "oh_stderr.log",
+    ):
+        try:
+            with open(sidecar, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    try:
+                        ev = json.loads(line)
+                    except json.JSONDecodeError:
+                        if _contains_oh_network_error(line):
+                            return True
+                        continue
+                    if ev.get("type") == "error" and _contains_oh_network_error(
+                        str(ev.get("message", ""))
+                    ):
+                        return True
+        except OSError:
+            continue
+    return False
+
+
 def _scan_completed_trials(trace_dir: Path) -> dict[str, int]:
     """Scan a trace directory and return {task_id: completed_trial_count}.
 
@@ -1043,7 +1103,7 @@ def _scan_completed_trials(trace_dir: Path) -> dict[str, int]:
     from collections import defaultdict
 
     completed: dict[str, int] = defaultdict(int)
-    for f in trace_dir.glob("*.jsonl"):
+    for f in trace_dir.rglob("*.jsonl"):
         with open(f) as fh:
             for line in fh:
                 line = line.strip()
@@ -1054,6 +1114,8 @@ def _scan_completed_trials(trace_dir: Path) -> dict[str, int]:
                 except json.JSONDecodeError:
                     continue
                 if ev.get("type") == "grading_result":
+                    if _trace_has_oh_network_error(f):
+                        break
                     task_id = ev.get("task_id", "")
                     if task_id:
                         completed[task_id] += 1
@@ -1073,7 +1135,9 @@ def _load_completed_results(trace_dir: Path) -> list[dict]:
     # task_id -> list of trial info dicts
     task_trials: dict[str, list[dict]] = defaultdict(list)
 
-    for f in sorted(trace_dir.glob("*.jsonl")):
+    for f in sorted(trace_dir.rglob("*.jsonl")):
+        if _trace_has_oh_network_error(f):
+            continue
         grading = None
         trace_end = None
         for line_str in open(f):
@@ -1202,10 +1266,13 @@ async def _run_task_all_trials_async(
 
     for i in range(trials):
         # Container-startup races (docker daemon under high parallelism, port
-        # binding stalls, health-probe flakes) get one automatic retry; grader
-        # / judge / model errors do not.
+        # binding stalls, health-probe flakes) get one automatic retry.
+        # OpenHarness/Codex streaming transport failures are trial-level
+        # infrastructure flakes, so retry them a few times too; grader / judge
+        # / model answer-quality errors do not retry.
         last_exc: Exception | None = None
-        for startup_attempt in range(2):
+        max_attempts = max(1, int(os.environ.get("CLAW_OH_NETWORK_ATTEMPTS", "3")))
+        for trial_attempt in range(max_attempts):
             try:
                 tr = await _run_one_trial(
                     spec,
@@ -1219,13 +1286,21 @@ async def _run_task_all_trials_async(
             except Exception as exc:
                 last_exc = exc
                 msg = str(exc)
-                if "[container-startup]" in msg and startup_attempt == 0:
+                if "[container-startup]" in msg and trial_attempt == 0:
                     print(
                         f"[trial-retry] {task.task_id} trial {i}: container startup failed "
                         f"({msg[:120]}) — retrying once",
                         flush=True,
                     )
                     await asyncio.sleep(2.0)
+                    continue
+                if "[oh-network]" in msg and trial_attempt < max_attempts - 1:
+                    print(
+                        f"[trial-retry] {task.task_id} trial {i}: OpenHarness network error "
+                        f"({msg[:120]}) — retrying attempt {trial_attempt + 2}/{max_attempts}",
+                        flush=True,
+                    )
+                    await asyncio.sleep(5.0)
                     continue
                 break
         if last_exc is not None:
