@@ -1076,10 +1076,20 @@ _MY_EXP_CATEGORY_TYPES = {"expense": 1, "income": 2}
 _MY_EXP_TYPE_ALIASES = {
     "checking": "BANK", "savings": "BANK",
     "credit": "CCARD", "credit_card": "CCARD",
-    "cash": "CASH",
+    "cash": "CASH", "digital_wallet": "CASH",
+    "business": "BANK",
     "asset": "ASSET",
     "liability": "LIABILITY",
 }
+
+
+def _normalize_my_expenses_account_type(raw_type) -> str:
+    raw = str(raw_type or "CASH")
+    return _MY_EXP_TYPE_ALIASES.get(raw.lower(), raw.upper())
+
+
+def _normalize_my_expenses_account_color(value) -> int:
+    return _hex_to_android_color(value, default=-3355444)
 
 
 def _normalize_my_expenses_data(raw) -> dict:
@@ -1097,7 +1107,16 @@ def _normalize_my_expenses_data(raw) -> dict:
     txs  = data.get("transactions", [])
     # Already correct if first account uses "label" and first tx uses "account"
     if accs and "label" in accs[0] and (not txs or "account" in txs[0]):
-        return data
+        normalized = dict(data)
+        normalized["accounts"] = [
+            {
+                **acc,
+                "type": _normalize_my_expenses_account_type(acc.get("type", "CASH")),
+                "color": _normalize_my_expenses_account_color(acc.get("color", -3355444)),
+            }
+            for acc in accs
+        ]
+        return normalized
 
     # Build id → label maps
     acc_id_to_label: dict[str, str] = {}
@@ -1107,8 +1126,7 @@ def _normalize_my_expenses_data(raw) -> dict:
         acc_id = acc.get("account_id") or acc.get("id", "")
         if acc_id:
             acc_id_to_label[acc_id] = label
-        raw_type = acc.get("type", "CASH")
-        norm_type = _MY_EXP_TYPE_ALIASES.get(raw_type.lower(), raw_type.upper())
+        norm_type = _normalize_my_expenses_account_type(acc.get("type", "CASH"))
         opening = acc.get("opening_balance") or acc.get("initial_balance") or acc.get("balance") or 0
         norm_accounts.append({
             "label":           label,
@@ -1116,7 +1134,7 @@ def _normalize_my_expenses_data(raw) -> dict:
             "type":            norm_type,
             "opening_balance": opening,
             "description":     acc.get("description", ""),
-            "color":           acc.get("color", -3355444),
+            "color":           _normalize_my_expenses_account_color(acc.get("color", -3355444)),
         })
 
     cat_id_to_label: dict[str, str] = {}
@@ -1619,7 +1637,8 @@ def inject_my_expenses(step: dict, task_dir: Path, device: str | None) -> bool:
             """, (
                 acc["label"], acc.get("currency", "USD"), acc_type,
                 int(acc.get("opening_balance", 0)), acc.get("description", ""),
-                int(acc.get("color", -3355444)), str(uuid_mod.uuid4()), "NONE", "DESC",
+                _normalize_my_expenses_account_color(acc.get("color", -3355444)),
+                str(uuid_mod.uuid4()), "NONE", "DESC",
             ))
             account_id_map[acc["label"]] = cur.lastrowid
             print(f"  [OK] account '{acc['label']}'")
@@ -2157,6 +2176,24 @@ TESTMALL_STATE_PATH = f"/sdcard/Android/data/{TESTMALL_PACKAGE}/files/state.json
 MATTERMOST_PACKAGE    = "com.mattermost.rnbeta"
 MATTERMOST_STATE_PATH = f"/sdcard/Android/data/{MATTERMOST_PACKAGE}/files/state.json"
 
+SHADOW_STATE_ROOT = "/data/local/tmp/claw_gui_state"
+
+
+def _shadow_state_fallback_path(package: str) -> str:
+    return f"{SHADOW_STATE_ROOT}/{package}/state.json"
+
+
+def _push_json_state(state: dict, remote_path: str, device: str | None) -> bool:
+    remote_dir = remote_path.rsplit("/", 1)[0]
+    adb_shell(f"mkdir -p {remote_dir}", device=device)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as tmp:
+        json.dump(state, tmp, ensure_ascii=False, indent=2)
+        tmp_path = tmp.name
+    try:
+        return adb_push(tmp_path, remote_path, device=device)
+    finally:
+        os.unlink(tmp_path)
+
 
 def _inject_shadow_app_state(
     step: dict,
@@ -2186,35 +2223,35 @@ def _inject_shadow_app_state(
         print(f"  [FAIL] {app_label} fixture must be a JSON list", file=sys.stderr)
         return False
 
+    state = {state_key: items}
+    fallback_path = _shadow_state_fallback_path(package)
+    adb_shell(f"rm -f {fallback_path}", device=device)
+    if not _push_json_state(state, fallback_path, device=device):
+        return False
+
     installed, package_msg = _package_installed(package, device=device)
     if not installed:
         print(
-            f"  [FAIL] package not installed: {package}"
+            f"  [WARN] package not installed: {package}; "
+            f"wrote {app_label} shadow state to {fallback_path}"
             + (f" ({package_msg})" if package_msg else ""),
             file=sys.stderr,
         )
-        return False
+        return True
 
     adb_shell(f"am force-stop {package}", device=device)
     adb_shell(f"rm -f {state_path}", device=device)
-    adb_shell(f"mkdir -p $(dirname {state_path})", device=device)
-
-    state = {state_key: items}
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as tmp:
-        json.dump(state, tmp, ensure_ascii=False, indent=2)
-        tmp_path = tmp.name
-    try:
-        ok = adb_push(tmp_path, state_path, device=device)
-    finally:
-        os.unlink(tmp_path)
-    if not ok:
+    if not _push_json_state(state, state_path, device=device):
         return False
 
     launch_ok, launch_msg = _start_package_launcher(package, device=device)
     if not launch_ok:
         print(f"  [FAIL] failed to relaunch {app_label}: {launch_msg}", file=sys.stderr)
         return False
-    print(f"  [OK] {app_label} restarted ({len(items)} item(s) injected)")
+    print(
+        f"  [OK] {app_label} restarted ({len(items)} item(s) injected; "
+        f"fallback state also at {fallback_path})"
+    )
     return True
 
 
