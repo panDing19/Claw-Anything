@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -120,14 +121,47 @@ class TaskDefinition(BaseModel):
     sandbox_files: list[str] = Field(default_factory=list)
     sandbox_grader_files: list[str] = Field(default_factory=list)
     task_file: str | None = Field(default=None, exclude=True)
+    gui_fixture_paths: list[str] = Field(default_factory=list, exclude=True)
+    gui_fixture_data: dict[str, Any] = Field(default_factory=dict, exclude=True)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> TaskDefinition:
-        with open(path) as f:
+        task_path = Path(path).resolve()
+        with open(task_path) as f:
             data = yaml.safe_load(f)
-        data["task_file"] = str(Path(path).resolve())
+        data["task_file"] = str(task_path)
+        gui_fixture_paths = _collect_gui_fixture_paths(data)
+        data["gui_fixture_paths"] = gui_fixture_paths
+        data["gui_fixture_data"] = _load_gui_fixture_data(task_path.parent, gui_fixture_paths)
         return cls.model_validate(data)
 
     def get_endpoint_map(self) -> dict[str, ToolEndpoint]:
         """Return {tool_name: ToolEndpoint} for dispatcher lookup."""
         return {ep.tool_name: ep for ep in self.tool_endpoints}
+
+
+def _collect_gui_fixture_paths(data: dict[str, Any]) -> list[str]:
+    paths: list[str] = []
+    for section in ("inject", "apps"):
+        entries = data.get(section)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            for key in ("fixture", "json", "file", "path"):
+                value = entry.get(key)
+                if isinstance(value, str):
+                    paths.append(value)
+    return list(dict.fromkeys(paths))
+
+
+def _load_gui_fixture_data(task_dir: Path, paths: list[str]) -> dict[str, Any]:
+    data: dict[str, Any] = {}
+    for rel_path in paths:
+        path = task_dir / rel_path
+        try:
+            data[rel_path] = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+    return data

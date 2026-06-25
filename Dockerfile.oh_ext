@@ -40,6 +40,11 @@ RUN pip install -e /opt/oh-ext \
         --trusted-host pypi.tuna.tsinghua.edu.cn \
         --no-cache-dir
 
+# Trial containers run as the invoking host UID, not root. Build contexts can
+# preserve restrictive source-tree modes, so editable sources must be readable
+# and traversable by that trial user.
+RUN chmod -R a+rX /opt/claw-anything /opt/oh-ext
+
 # ── Build-time patches ───────────────────────────────────────────────────────
 # Shared with claw-anything-oh — the patched anchors are identical in vanilla OH
 # and the OH-Ext fork. Run after the editable install so ``import openharness``

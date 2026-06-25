@@ -11,6 +11,7 @@ import pytest
 from claw_anything.models.task import TaskDefinition
 from claw_anything.runner.openharness_plugin_gen import (
     _build_local_gui_state,
+    _normalize_local_my_expenses,
     _render_generated_tools,
 )
 
@@ -169,6 +170,46 @@ def test_openharness_plugin_embeds_inject_gui_fixtures() -> None:
     state = _build_local_gui_state(task)
 
     assert any(alarm["alarm_id"] == "ALRM-101" for alarm in state["clock"]["alarms"])
+
+
+def test_openharness_plugin_uses_cached_gui_fixture_data_after_redaction(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    task = TaskDefinition.from_yaml(
+        root / "benchmark/gui/TGUI01_myexpenses_overbudget_finance_email/task.yaml"
+    )
+    task.task_file = str(tmp_path / "redacted-task.yaml")
+
+    state = _build_local_gui_state(task)
+
+    assert len(state["my_expenses"]["accounts"]) == 2
+    assert len(state["my_expenses"]["transactions"]) == 20
+
+
+def test_openharness_plugin_normalizes_label_wrapped_my_expenses_fixture() -> None:
+    raw = [
+        {
+            "label": "Business account",
+            "accounts": [{"id": "ACC-001", "name": "Business Checking"}],
+            "categories": [{"id": "CAT-001", "name": "SaaS Subscriptions"}],
+            "transactions": [
+                {
+                    "id": "TXN-001",
+                    "account_id": "ACC-001",
+                    "category_id": "CAT-001",
+                    "date": "2026-03-10",
+                    "amount": -1280.0,
+                    "payee": "DataLytics Cloud",
+                }
+            ],
+        }
+    ]
+
+    data = _normalize_local_my_expenses(raw)
+
+    assert data["accounts"][0]["account_id"] == "ACC-001"
+    assert data["transactions"][0]["transaction_id"] == "TXN-001"
+    assert data["transactions"][0]["account"] == "Business Checking"
+    assert data["transactions"][0]["category"] == "SaaS Subscriptions"
 
 
 def test_generated_openharness_plugin_serves_declared_gui_endpoints_locally(monkeypatch) -> None:

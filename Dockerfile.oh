@@ -42,6 +42,11 @@ RUN pip install 'openharness-ai==0.1.9' \
         --no-cache-dir \
     || pip install 'openharness-ai==0.1.9' --no-cache-dir
 
+# Trial containers run as the invoking host UID, not root. Build contexts can
+# preserve restrictive source-tree modes, so editable sources must be readable
+# and traversable by that trial user.
+RUN chmod -R a+rX /opt/claw-anything
+
 # ── Build-time patches for openharness-ai 0.1.9 ──────────────────────────────
 # Each script does a single OLD→NEW string substitution in the installed OH
 # source and raises if the anchor line is gone, so a future openharness-ai

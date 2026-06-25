@@ -1188,9 +1188,48 @@ def _normalize_local_gmail_clone(raw: Any) -> list[dict]:
 
 
 def _normalize_local_my_expenses(raw: Any) -> dict[str, Any]:
-    if not isinstance(raw, dict):
-        return {"accounts": [], "categories": [], "payees": [], "transactions": []}
-    data = json.loads(json.dumps(raw))
+    data = {"accounts": [], "categories": [], "payees": [], "transactions": []}
+    containers = raw if isinstance(raw, list) else [raw] if isinstance(raw, dict) else []
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        for key in ("accounts", "categories", "transactions"):
+            for item in _as_list(container.get(key)):
+                if isinstance(item, dict):
+                    data[key].append(json.loads(json.dumps(item)))
+        for payee in _as_list(container.get("payees")):
+            if payee is not None:
+                data["payees"].append(payee)
+
+    accounts = []
+    for index, item in enumerate(_as_list(data.get("accounts"))):
+        if not isinstance(item, dict):
+            continue
+        account = dict(item)
+        raw_id = account.get("account_id") or account.get("id") or account.get("name") or f"ACC-{index + 1}"
+        account["account_id"] = str(raw_id)
+        accounts.append(account)
+    data["accounts"] = accounts
+
+    categories = []
+    for index, item in enumerate(_as_list(data.get("categories"))):
+        if not isinstance(item, dict):
+            continue
+        category = dict(item)
+        raw_id = category.get("category_id") or category.get("id") or category.get("name") or f"CAT-{index + 1}"
+        category["category_id"] = str(raw_id)
+        categories.append(category)
+    data["categories"] = categories
+
+    account_names = {
+        str(account.get("account_id") or ""): account.get("name") or account.get("label") or ""
+        for account in accounts
+    }
+    category_names = {
+        str(category.get("category_id") or ""): category.get("name") or category.get("label") or ""
+        for category in categories
+    }
+
     transactions = []
     for index, item in enumerate(_as_list(data.get("transactions"))):
         if not isinstance(item, dict):
@@ -1198,11 +1237,30 @@ def _normalize_local_my_expenses(raw: Any) -> dict[str, Any]:
         txn = dict(item)
         raw_id = txn.get("transaction_id") or txn.get("id") or f"TRX-{index + 1}"
         txn["transaction_id"] = str(raw_id)
+        account_id = txn.get("account_id") or txn.get("account")
+        if account_id is not None:
+            txn["account_id"] = str(account_id)
+            if not txn.get("account"):
+                txn["account"] = account_names.get(str(account_id), "")
+        category_id = txn.get("category_id") or txn.get("category")
+        if category_id is not None:
+            txn["category_id"] = str(category_id)
+            if not txn.get("category"):
+                txn["category"] = category_names.get(str(category_id), "")
         transactions.append(txn)
     data["transactions"] = transactions
-    data.setdefault("accounts", [])
-    data.setdefault("categories", [])
-    data.setdefault("payees", [])
+    payees = []
+    seen_payees = set()
+    for payee in data.get("payees") or []:
+        try:
+            key = json.dumps(payee, ensure_ascii=False, sort_keys=True)
+        except TypeError:
+            key = str(payee)
+        if key in seen_payees:
+            continue
+        seen_payees.add(key)
+        payees.append(payee)
+    data["payees"] = payees
     return data
 
 
@@ -1229,6 +1287,7 @@ def _normalize_local_testmall(raw: Any) -> list[dict]:
 def _collect_gui_fixture_paths(task: TaskDefinition) -> list[str]:
     paths: list[str] = []
     paths.extend(task.environment.fixtures)
+    paths.extend(getattr(task, "gui_fixture_paths", []) or [])
     if not task.task_file:
         return paths
     try:
@@ -1260,14 +1319,18 @@ def _build_local_gui_state(task: TaskDefinition) -> dict[str, Any]:
         return {}
     task_dir = Path(task.task_file).parent
     state: dict[str, Any] = {}
+    cached_fixtures = getattr(task, "gui_fixture_data", {}) or {}
     for fixture in _collect_gui_fixture_paths(task):
-        path = task_dir / fixture
-        if not path.exists():
-            continue
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
+        if fixture in cached_fixtures:
+            raw = cached_fixtures[fixture]
+        else:
+            path = task_dir / fixture
+            if not path.exists():
+                continue
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
         if "fossify_messages_gui" in fixture:
             state["fossify_messages"] = {
                 "threads": _normalize_local_fossify_messages(raw),
