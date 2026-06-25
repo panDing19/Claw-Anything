@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import importlib
 import json
+import sys
+import types
 from pathlib import Path
 
 import pytest
 
 from claw_anything.models.task import TaskDefinition
-from claw_anything.runner.openharness_plugin_gen import _build_local_gui_state
+from claw_anything.runner.openharness_plugin_gen import (
+    _build_local_gui_state,
+    _render_generated_tools,
+)
 
 
 gui_init = importlib.import_module("claw_anything.task.mobile_gui.init_gui_task")
@@ -136,3 +141,64 @@ def test_tgui46_openharness_plugin_embeds_gui_fixture_state() -> None:
         for thread in threads
     )
     assert any(note["note_id"] == "FNOT-221" for note in notes)
+
+
+def test_openharness_plugin_embeds_inject_gui_fixtures() -> None:
+    root = Path(__file__).resolve().parents[1]
+
+    task = TaskDefinition.from_yaml(
+        root / "benchmark/gui/TGUI10_calendar_event_finance_myexpenses_log/task.yaml"
+    )
+    state = _build_local_gui_state(task)
+
+    assert any(event["event_id"] == "FCAL-1001" for event in state["fossify_calendar"]["events"])
+    assert any(txn["transaction_id"] == "TRX-1001" for txn in state["my_expenses"]["transactions"])
+    assert any(habit["habit_id"] == "HAB-1001" for habit in state["loop_habit"]["habits"])
+
+    task = TaskDefinition.from_yaml(
+        root / "benchmark/gui/TGUI05_contacts_birthday_calendar_gift/task.yaml"
+    )
+    state = _build_local_gui_state(task)
+
+    assert any(contact["contact_id"] == "GCON-901" for contact in state["contacts"]["contacts"])
+    assert any(product["product_id"] == "PROD-5001" for product in state["testmall"]["products"])
+
+
+def test_generated_openharness_plugin_serves_declared_gui_endpoints_locally(monkeypatch) -> None:
+    base_mod = types.ModuleType("openharness.tools.base")
+
+    class BaseTool:
+        pass
+
+    class ToolExecutionContext:
+        pass
+
+    class ToolResult:
+        def __init__(self, output: str, is_error: bool = False):
+            self.output = output
+            self.is_error = is_error
+
+    base_mod.BaseTool = BaseTool
+    base_mod.ToolExecutionContext = ToolExecutionContext
+    base_mod.ToolResult = ToolResult
+    monkeypatch.setitem(sys.modules, "openharness", types.ModuleType("openharness"))
+    monkeypatch.setitem(sys.modules, "openharness.tools", types.ModuleType("openharness.tools"))
+    monkeypatch.setitem(sys.modules, "openharness.tools.base", base_mod)
+
+    root = Path(__file__).resolve().parents[1] / "benchmark/gui"
+    missing: list[str] = []
+    for task_yaml in sorted(root.glob("TGUI*/task.yaml")):
+        task = TaskDefinition.from_yaml(task_yaml)
+        source = _render_generated_tools(task)
+        namespace: dict[str, object] = {}
+        exec(compile(source, f"{task_yaml}:generated", "exec"), namespace)
+        handler = namespace["_handle_local_gui_tool"]
+
+        for endpoint in task.tool_endpoints:
+            if "/gui/" not in endpoint.url:
+                continue
+            result = handler(endpoint.tool_name, endpoint.url, {})
+            if result is None:
+                missing.append(f"{task_yaml.parent.name}: {endpoint.tool_name} -> {endpoint.url}")
+
+    assert not missing, "\n".join(missing)

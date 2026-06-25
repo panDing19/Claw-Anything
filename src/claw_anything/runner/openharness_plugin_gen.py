@@ -23,6 +23,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from ..models.task import TaskDefinition
 
 
@@ -221,7 +223,7 @@ def _make_tool_class(
         async def execute(self, arguments: BaseModel, context: ToolExecutionContext) -> ToolResult:
             payload = arguments.model_dump()
             t0 = time.monotonic()
-            local_result = _handle_local_gui_tool(tool_name, payload)
+            local_result = _handle_local_gui_tool(tool_name, endpoint_url, payload)
             if local_result is not None:
                 status, body = local_result
                 latency_ms = (time.monotonic() - t0) * 1000.0
@@ -292,6 +294,74 @@ def _text_match(query: Any, *values: Any) -> bool:
     if not q:
         return True
     return any(q in str(value or "").lower() for value in values)
+
+
+def _max_results(payload: dict, default: int = 50) -> int:
+    try:
+        return max(1, int(payload.get("max_results") or default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _record_id(record: dict, *fields: str) -> str:
+    for field in fields:
+        value = record.get(field)
+        if value is not None and value != "":
+            return str(value)
+    for field in (
+        "id",
+        "event_id",
+        "contact_id",
+        "message_id",
+        "transaction_id",
+        "habit_id",
+        "call_id",
+        "product_id",
+        "note_id",
+    ):
+        value = record.get(field)
+        if value is not None and value != "":
+            return str(value)
+    return ""
+
+
+def _find_record(records: list, value: Any, *fields: str) -> dict | None:
+    wanted = str(value or "")
+    if not wanted:
+        return None
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        candidates = {_record_id(record, *fields)}
+        for field in fields:
+            raw = record.get(field)
+            if raw is not None:
+                candidates.add(str(raw))
+        if wanted in candidates:
+            return record
+    return None
+
+
+def _date_part(value: Any) -> str:
+    return str(value or "")[:10]
+
+
+def _in_date_range(value: Any, start: Any = None, end: Any = None) -> bool:
+    date = _date_part(value)
+    if not date:
+        return True
+    start_s = _date_part(start)
+    end_s = _date_part(end)
+    if start_s and date < start_s:
+        return False
+    if end_s and date > end_s:
+        return False
+    return True
+
+
+def _body_preview(text: Any, limit: int = 180) -> str:
+    s = str(text or "")
+    return s if len(s) <= limit else s[:limit] + "..."
 
 
 def _handle_fossify_messages(tool_name: str, payload: dict) -> tuple[int, Any]:
@@ -463,12 +533,443 @@ def _handle_fossify_notes(tool_name: str, payload: dict) -> tuple[int, Any]:
     return 404, {"error": f"Unsupported Fossify Notes tool: {tool_name}"}
 
 
-def _handle_local_gui_tool(tool_name: str, payload: dict) -> tuple[int, Any] | None:
-    if tool_name.startswith("fossify_messages"):
+def _handle_fossify_calendar(tool_name: str, payload: dict) -> tuple[int, Any]:
+    state = _LOCAL_GUI_STATE.setdefault("fossify_calendar", {})
+    events = state.setdefault("events", [])
+
+    if tool_name.endswith("_list_events"):
+        query = payload.get("query")
+        start = payload.get("date_from") or payload.get("start_date") or payload.get("date")
+        end = payload.get("date_to") or payload.get("end_date")
+        max_results = _max_results(payload)
+        matches = []
+        for event in events:
+            if not _in_date_range(event.get("start_time"), start, end):
+                continue
+            if not _text_match(
+                query,
+                event.get("event_id"),
+                event.get("title"),
+                event.get("description"),
+                event.get("location"),
+            ):
+                continue
+            matches.append(event)
+        return 200, {"events": matches[:max_results], "total": len(matches), "returned": min(len(matches), max_results)}
+
+    if tool_name.endswith("_get_event"):
+        event_id = payload.get("event_id")
+        event = _find_record(events, event_id, "event_id", "id")
+        if event is None:
+            return (400 if not event_id else 404), {"error": f"Event not found: {event_id}"}
+        return 200, event
+
+    if tool_name.endswith("_create_event"):
+        title = str(payload.get("title") or "").strip()
+        start_time = payload.get("start_time")
+        end_time = payload.get("end_time")
+        if not title or not start_time or not end_time:
+            return 400, {"error": "title, start_time and end_time are required"}
+        event_id = f"FCAL-LOCAL-{len(events) + 1}"
+        event = {
+            "event_id": event_id,
+            "title": title,
+            "start_time": start_time,
+            "end_time": end_time,
+            "location": payload.get("location") or "",
+            "description": payload.get("description") or "",
+            "recurring": payload.get("recurring") or "none",
+            "reminder_minutes": payload.get("reminder_minutes"),
+            "color": payload.get("color"),
+        }
+        events.append(event)
+        return 200, {"status": "created", **event}
+
+    if tool_name.endswith("_update_event"):
+        event_id = payload.get("event_id")
+        event = _find_record(events, event_id, "event_id", "id")
+        if event is None:
+            return (400 if not event_id else 404), {"error": f"Event not found: {event_id}"}
+        for key in ("title", "start_time", "end_time", "location", "description", "recurring", "reminder_minutes", "color"):
+            if key in payload:
+                event[key] = payload[key]
+        return 200, {"status": "updated", "event_id": event_id}
+
+    return 404, {"error": f"Unsupported Fossify Calendar tool: {tool_name}"}
+
+
+def _handle_contacts(tool_name: str, payload: dict) -> tuple[int, Any]:
+    state = _LOCAL_GUI_STATE.setdefault("contacts", {})
+    contacts = state.setdefault("contacts", [])
+
+    if tool_name.endswith("_list"):
+        query = payload.get("query")
+        group = str(payload.get("group") or "").strip().lower()
+        max_results = _max_results(payload)
+        matches = []
+        for contact in contacts:
+            if group and group != str(contact.get("group") or "").lower():
+                continue
+            if not _text_match(query, *contact.values()):
+                continue
+            matches.append(contact)
+        return 200, {"contacts": matches[:max_results], "total": len(matches), "returned": min(len(matches), max_results)}
+
+    if tool_name.endswith("_get"):
+        contact_id = payload.get("contact_id")
+        contact = _find_record(contacts, contact_id, "contact_id", "id")
+        if contact is None:
+            return (400 if not contact_id else 404), {"error": f"Contact not found: {contact_id}"}
+        return 200, contact
+
+    if tool_name.endswith("_create"):
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            return 400, {"error": "name is required"}
+        contact = {
+            "contact_id": f"GCON-LOCAL-{len(contacts) + 1}",
+            "name": name,
+            "phone": payload.get("phone") or "",
+            "email": payload.get("email") or "",
+            "company": payload.get("company") or "",
+            "title": payload.get("title") or "",
+            "note": payload.get("note") or "",
+            "group": payload.get("group") or "",
+            "starred": bool(payload.get("starred", False)),
+        }
+        contacts.append(contact)
+        return 200, {"status": "created", **contact}
+
+    if tool_name.endswith("_update"):
+        contact_id = payload.get("contact_id")
+        contact = _find_record(contacts, contact_id, "contact_id", "id")
+        if contact is None:
+            return (400 if not contact_id else 404), {"error": f"Contact not found: {contact_id}"}
+        for key in ("name", "phone", "email", "company", "title", "note", "group", "address", "birthday", "preferences", "starred"):
+            if key in payload:
+                contact[key] = payload[key]
+        return 200, {"status": "updated", "contact_id": contact_id}
+
+    return 404, {"error": f"Unsupported Contacts tool: {tool_name}"}
+
+
+def _handle_gmail_clone(tool_name: str, payload: dict) -> tuple[int, Any]:
+    state = _LOCAL_GUI_STATE.setdefault("gmail_clone", {})
+    messages = state.setdefault("messages", [])
+    sent = state.setdefault("sent_messages", [])
+    drafts = state.setdefault("drafts", [])
+
+    if tool_name.endswith("_list_messages"):
+        query = payload.get("query")
+        label = str(payload.get("label") or "").strip().lower()
+        unread_only = bool(payload.get("unread_only", False))
+        max_results = _max_results(payload)
+        matches = []
+        for message in messages:
+            labels = [str(v).lower() for v in (message.get("labels") or [])]
+            if label and label not in labels:
+                continue
+            if unread_only and bool(message.get("is_read", True)):
+                continue
+            if not _text_match(query, message.get("from"), message.get("to"), message.get("subject"), message.get("body"), " ".join(labels)):
+                continue
+            matches.append({
+                "message_id": _record_id(message, "message_id", "id"),
+                "id": message.get("id"),
+                "from": message.get("from"),
+                "to": message.get("to"),
+                "subject": message.get("subject"),
+                "date": message.get("date"),
+                "is_read": bool(message.get("is_read", True)),
+                "labels": message.get("labels") or [],
+                "body_preview": _body_preview(message.get("body")),
+            })
+        return 200, {"messages": matches[:max_results], "total": len(matches), "returned": min(len(matches), max_results)}
+
+    if tool_name.endswith("_get_message"):
+        message_id = payload.get("message_id")
+        message = _find_record(messages, message_id, "message_id", "id")
+        if message is None:
+            return (400 if not message_id else 404), {"error": f"Message not found: {message_id}"}
+        message["is_read"] = True
+        return 200, message
+
+    if tool_name.endswith("_send_message") or tool_name.endswith("_save_draft"):
+        to = str(payload.get("to") or "").strip()
+        subject = str(payload.get("subject") or "").strip()
+        body = str(payload.get("body") or "")
+        if not to or not subject or not body:
+            return 400, {"error": "to, subject and body are required"}
+        is_draft = tool_name.endswith("_save_draft")
+        message = {
+            "message_id": ("GDRAFT-LOCAL-" if is_draft else "GMSG-SENT-LOCAL-") + str((len(drafts) if is_draft else len(sent)) + 1),
+            "from": "me",
+            "to": to,
+            "cc": payload.get("cc"),
+            "subject": subject,
+            "body": body,
+            "date": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
+            "labels": ["drafts"] if is_draft else ["sent"],
+            "thread_id": payload.get("thread_id"),
+            "is_read": True,
+        }
+        (drafts if is_draft else sent).append(message)
+        messages.append(message)
+        return 200, {"status": "draft_saved" if is_draft else "sent", **message}
+
+    if tool_name.endswith("_update_message"):
+        message_id = payload.get("message_id")
+        message = _find_record(messages, message_id, "message_id", "id")
+        if message is None:
+            return (400 if not message_id else 404), {"error": f"Message not found: {message_id}"}
+        if "read" in payload:
+            message["is_read"] = bool(payload.get("read"))
+        labels = list(message.get("labels") or [])
+        if payload.get("add_labels"):
+            labels = list(dict.fromkeys([*labels, *payload.get("add_labels")]))
+        if payload.get("remove_labels"):
+            remove = set(payload.get("remove_labels") or [])
+            labels = [label for label in labels if label not in remove]
+        if payload.get("archived") and "archived" not in labels:
+            labels.append("archived")
+        if payload.get("trashed") and "trash" not in labels:
+            labels.append("trash")
+        message["labels"] = labels
+        return 200, {"status": "updated", "message_id": message_id, "labels": labels}
+
+    return 404, {"error": f"Unsupported Gmail Clone tool: {tool_name}"}
+
+
+def _handle_my_expenses(tool_name: str, payload: dict) -> tuple[int, Any]:
+    state = _LOCAL_GUI_STATE.setdefault("my_expenses", {})
+    transactions = state.setdefault("transactions", [])
+
+    if tool_name.endswith("_list_transactions"):
+        start = payload.get("date_from") or payload.get("start_date")
+        end = payload.get("date_to") or payload.get("end_date")
+        category = str(payload.get("category") or payload.get("category_id") or "").strip().lower()
+        account = str(payload.get("account") or payload.get("account_id") or "").strip().lower()
+        query = payload.get("query")
+        max_results = _max_results(payload)
+        matches = []
+        for txn in transactions:
+            if not _in_date_range(txn.get("date"), start, end):
+                continue
+            if category and category not in str(txn.get("category") or txn.get("category_id") or "").lower():
+                continue
+            if account and account not in str(txn.get("account") or txn.get("account_id") or "").lower():
+                continue
+            if not _text_match(query, *txn.values()):
+                continue
+            matches.append(txn)
+        return 200, {"transactions": matches[:max_results], "total": len(matches), "returned": min(len(matches), max_results)}
+
+    if tool_name.endswith("_get_transaction"):
+        transaction_id = payload.get("transaction_id")
+        txn = _find_record(transactions, transaction_id, "transaction_id", "id")
+        if txn is None:
+            return (400 if not transaction_id else 404), {"error": f"Transaction not found: {transaction_id}"}
+        return 200, txn
+
+    if tool_name.endswith("_create_transaction") or tool_name.endswith("_add_transaction"):
+        if "amount" not in payload:
+            return 400, {"error": "amount is required"}
+        txn = {
+            "transaction_id": f"TRX-LOCAL-{len(transactions) + 1}",
+            "date": payload.get("date") or time.strftime("%Y-%m-%d", time.gmtime()),
+            "account_id": payload.get("account_id"),
+            "account": payload.get("account"),
+            "category_id": payload.get("category_id"),
+            "category": payload.get("category"),
+            "payee": payload.get("payee"),
+            "amount": payload.get("amount"),
+            "description": payload.get("description") or payload.get("comment") or "",
+            "notes": payload.get("notes") or payload.get("comment") or "",
+            "tags": payload.get("tags") or [],
+            "status": payload.get("status") or "cleared",
+        }
+        transactions.append(txn)
+        return 200, {"status": "created", **txn}
+
+    if tool_name.endswith("_update_transaction"):
+        transaction_id = payload.get("transaction_id")
+        txn = _find_record(transactions, transaction_id, "transaction_id", "id")
+        if txn is None:
+            return (400 if not transaction_id else 404), {"error": f"Transaction not found: {transaction_id}"}
+        for key in ("date", "account_id", "account", "category_id", "category", "payee", "amount", "description", "notes", "comment", "tags", "status"):
+            if key in payload:
+                txn[key] = payload[key]
+        return 200, {"status": "updated", "transaction_id": transaction_id}
+
+    return 404, {"error": f"Unsupported My Expenses tool: {tool_name}"}
+
+
+def _handle_loop_habit(tool_name: str, payload: dict) -> tuple[int, Any]:
+    state = _LOCAL_GUI_STATE.setdefault("loop_habit", {})
+    habits = state.setdefault("habits", [])
+
+    if tool_name.endswith("_list_habits"):
+        query = payload.get("query")
+        matches = [habit for habit in habits if _text_match(query, habit.get("habit_id"), habit.get("name"), habit.get("frequency"), habit.get("unit"))]
+        return 200, {"habits": matches, "total": len(matches), "returned": len(matches)}
+
+    if tool_name.endswith("_check_habit") or tool_name.endswith("_check_in"):
+        habit_id = payload.get("habit_id")
+        habit = _find_record(habits, habit_id, "habit_id", "id")
+        if habit is None:
+            return (400 if not habit_id else 404), {"error": f"Habit not found: {habit_id}"}
+        date = payload.get("date") or time.strftime("%Y-%m-%d", time.gmtime())
+        value = payload.get("value", habit.get("target_value", 1))
+        completions = habit.setdefault("completions", [])
+        existing = next((item for item in completions if isinstance(item, dict) and item.get("date") == date), None)
+        if existing is None:
+            completions.append({"date": date, "value": value})
+        else:
+            existing["value"] = value
+        return 200, {"status": "checked", "habit_id": habit_id, "date": date, "value": value}
+
+    if tool_name.endswith("_list_completions"):
+        habit_id = payload.get("habit_id")
+        habit = _find_record(habits, habit_id, "habit_id", "id")
+        if habit is None:
+            return (400 if not habit_id else 404), {"error": f"Habit not found: {habit_id}"}
+        start = payload.get("start_date")
+        end = payload.get("end_date")
+        completions = [item for item in habit.get("completions", []) if isinstance(item, dict) and _in_date_range(item.get("date"), start, end)]
+        return 200, {"habit_id": habit_id, "completions": completions, "total": len(completions)}
+
+    return 404, {"error": f"Unsupported Loop Habit tool: {tool_name}"}
+
+
+def _handle_dialer(tool_name: str, payload: dict) -> tuple[int, Any]:
+    state = _LOCAL_GUI_STATE.setdefault("dialer", {})
+    calls = state.setdefault("call_log", [])
+
+    if tool_name.endswith("_list_call_log"):
+        call_type = str(payload.get("call_type") or "").strip().lower()
+        max_results = _max_results(payload)
+        matches = [
+            call for call in calls
+            if not call_type or call_type == str(call.get("call_type") or "").lower()
+        ]
+        return 200, {"calls": matches[:max_results], "total": len(matches), "returned": min(len(matches), max_results)}
+
+    if tool_name.endswith("_get_call_details"):
+        call_id = payload.get("call_id")
+        call = _find_record(calls, call_id, "call_id", "id")
+        if call is None:
+            return (400 if not call_id else 404), {"error": f"Call not found: {call_id}"}
+        return 200, call
+
+    return 404, {"error": f"Unsupported Dialer tool: {tool_name}"}
+
+
+def _handle_mattermost(tool_name: str, payload: dict) -> tuple[int, Any]:
+    state = _LOCAL_GUI_STATE.setdefault("mattermost", {})
+    messages = state.setdefault("messages", [])
+
+    if tool_name.endswith("_list_channels"):
+        channels: dict[str, dict] = {}
+        for msg in messages:
+            channel_id = str(msg.get("channel_id") or msg.get("channel_name") or "default")
+            channel = channels.setdefault(
+                channel_id,
+                {
+                    "channel_id": channel_id,
+                    "channel_name": msg.get("channel_name") or channel_id,
+                    "message_count": 0,
+                    "unread_count": 0,
+                },
+            )
+            channel["message_count"] += 1
+        return 200, {"channels": list(channels.values()), "total": len(channels)}
+
+    if tool_name.endswith("_send_message"):
+        channel_id = str(payload.get("channel_id") or "").strip()
+        text = str(payload.get("text") or "").strip()
+        if not channel_id or not text:
+            return 400, {"error": "channel_id and text are required"}
+        msg = {
+            "message_id": f"MMSG-LOCAL-{len(messages) + 1}",
+            "channel_id": channel_id,
+            "channel_name": channel_id,
+            "author": "me",
+            "text": text,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
+            "reactions": [],
+            "pinned": False,
+            "root_id": payload.get("root_id"),
+        }
+        messages.append(msg)
+        return 200, {"status": "sent", **msg}
+
+    return 404, {"error": f"Unsupported Mattermost tool: {tool_name}"}
+
+
+def _handle_testmall(tool_name: str, payload: dict) -> tuple[int, Any]:
+    state = _LOCAL_GUI_STATE.setdefault("testmall", {})
+    products = state.setdefault("products", [])
+
+    if tool_name.endswith("_list_products"):
+        query = payload.get("query")
+        category = str(payload.get("category") or "").strip().lower()
+        max_results = _max_results(payload)
+        min_price = payload.get("min_price")
+        max_price = payload.get("max_price")
+        matches = []
+        for product in products:
+            if category and category not in str(product.get("category") or "").lower():
+                continue
+            price = product.get("price")
+            try:
+                numeric_price = float(price)
+            except (TypeError, ValueError):
+                numeric_price = None
+            if min_price is not None and numeric_price is not None and numeric_price < float(min_price):
+                continue
+            if max_price is not None and numeric_price is not None and numeric_price > float(max_price):
+                continue
+            if not _text_match(query, *product.values()):
+                continue
+            matches.append(product)
+        return 200, {"products": matches[:max_results], "total": len(matches), "returned": min(len(matches), max_results)}
+
+    if tool_name.endswith("_get_product"):
+        product_id = payload.get("product_id")
+        product = _find_record(products, product_id, "product_id", "id", "sku")
+        if product is None:
+            return (400 if not product_id else 404), {"error": f"Product not found: {product_id}"}
+        return 200, product
+
+    return 404, {"error": f"Unsupported TestMall tool: {tool_name}"}
+
+
+def _handle_local_gui_tool(tool_name: str, endpoint_url: str, payload: dict) -> tuple[int, Any] | None:
+    if "/gui/" not in str(endpoint_url):
+        return None
+    match = re.search(r"/gui/([^/?#]+)/([^/?#]+)", str(endpoint_url))
+    app = match.group(1) if match else ""
+    if app == "fossify_messages" or tool_name.startswith("fossify_messages"):
         return _handle_fossify_messages(tool_name, payload)
-    if tool_name.startswith("fossify_notes"):
+    if app == "fossify_notes" or tool_name.startswith("fossify_notes"):
         return _handle_fossify_notes(tool_name, payload)
-    return None
+    if app == "fossify_calendar" or tool_name.startswith("fossify_calendar"):
+        return _handle_fossify_calendar(tool_name, payload)
+    if app == "contacts" or tool_name.startswith("contacts"):
+        return _handle_contacts(tool_name, payload)
+    if app == "gmail_clone" or tool_name.startswith("gmail_clone"):
+        return _handle_gmail_clone(tool_name, payload)
+    if app == "my_expenses" or tool_name.startswith("my_expenses"):
+        return _handle_my_expenses(tool_name, payload)
+    if app == "loop_habit" or tool_name.startswith("loop_habit") or tool_name.startswith("loop_habits"):
+        return _handle_loop_habit(tool_name, payload)
+    if app == "dialer" or tool_name.startswith("dialer"):
+        return _handle_dialer(tool_name, payload)
+    if app == "mattermost" or tool_name.startswith("mattermost"):
+        return _handle_mattermost(tool_name, payload)
+    if app == "testmall" or tool_name.startswith("testmall"):
+        return _handle_testmall(tool_name, payload)
+    return 404, {"error": f"Unsupported local GUI endpoint: {endpoint_url}"}
 '''
 
 
@@ -578,6 +1079,105 @@ def _normalize_local_fossify_notes(raw: Any) -> list[dict]:
     return notes
 
 
+def _as_list(raw: Any) -> list[Any]:
+    return raw if isinstance(raw, list) else []
+
+
+def _normalize_record_list(raw: Any, id_field: str | None = None, id_prefix: str = "LOCAL") -> list[dict]:
+    records: list[dict] = []
+    for index, item in enumerate(_as_list(raw)):
+        if not isinstance(item, dict):
+            continue
+        record = dict(item)
+        if id_field:
+            raw_id = record.get(id_field) or record.get("id")
+            if raw_id is None or raw_id == "":
+                raw_id = f"{id_prefix}-{index + 1}"
+            record[id_field] = str(raw_id)
+        records.append(record)
+    return records
+
+
+def _normalize_local_fossify_calendar(raw: Any) -> list[dict]:
+    return _normalize_record_list(raw, "event_id", "FCAL")
+
+
+def _normalize_local_contacts(raw: Any) -> list[dict]:
+    return _normalize_record_list(raw, "contact_id", "GCON")
+
+
+def _normalize_local_gmail_clone(raw: Any) -> list[dict]:
+    messages: list[dict] = []
+    for index, item in enumerate(_as_list(raw)):
+        if not isinstance(item, dict):
+            continue
+        msg = dict(item)
+        raw_id = msg.get("message_id") or msg.get("id") or f"GMSG-{index + 1}"
+        msg["message_id"] = str(raw_id)
+        msg.setdefault("labels", [])
+        msg.setdefault("is_read", True)
+        messages.append(msg)
+    return messages
+
+
+def _normalize_local_my_expenses(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {"accounts": [], "categories": [], "payees": [], "transactions": []}
+    data = json.loads(json.dumps(raw))
+    transactions = []
+    for index, item in enumerate(_as_list(data.get("transactions"))):
+        if not isinstance(item, dict):
+            continue
+        txn = dict(item)
+        raw_id = txn.get("transaction_id") or txn.get("id") or f"TRX-{index + 1}"
+        txn["transaction_id"] = str(raw_id)
+        transactions.append(txn)
+    data["transactions"] = transactions
+    data.setdefault("accounts", [])
+    data.setdefault("categories", [])
+    data.setdefault("payees", [])
+    return data
+
+
+def _normalize_local_loop_habit(raw: Any) -> list[dict]:
+    return _normalize_record_list(raw, "habit_id", "HAB")
+
+
+def _normalize_local_dialer(raw: Any) -> list[dict]:
+    return _normalize_record_list(raw, "call_id", "CALL")
+
+
+def _normalize_local_mattermost(raw: Any) -> list[dict]:
+    return _normalize_record_list(raw, "message_id", "MMSG")
+
+
+def _normalize_local_testmall(raw: Any) -> list[dict]:
+    return _normalize_record_list(raw, "product_id", "PROD")
+
+
+def _collect_gui_fixture_paths(task: TaskDefinition) -> list[str]:
+    paths: list[str] = []
+    paths.extend(task.environment.fixtures)
+    if not task.task_file:
+        return paths
+    try:
+        raw_task = yaml.safe_load(Path(task.task_file).read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return paths
+    for section in ("inject", "apps"):
+        entries = raw_task.get(section)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            for key in ("fixture", "json", "file", "path"):
+                value = entry.get(key)
+                if isinstance(value, str):
+                    paths.append(value)
+    return list(dict.fromkeys(paths))
+
+
 def _build_local_gui_state(task: TaskDefinition) -> dict[str, Any]:
     """Embed GUI fixtures for task-declared semantic GUI tools.
 
@@ -589,7 +1189,7 @@ def _build_local_gui_state(task: TaskDefinition) -> dict[str, Any]:
         return {}
     task_dir = Path(task.task_file).parent
     state: dict[str, Any] = {}
-    for fixture in task.environment.fixtures:
+    for fixture in _collect_gui_fixture_paths(task):
         path = task_dir / fixture
         if not path.exists():
             continue
@@ -605,6 +1205,38 @@ def _build_local_gui_state(task: TaskDefinition) -> dict[str, Any]:
         elif "fossify_notes_gui" in fixture:
             state["fossify_notes"] = {
                 "notes": _normalize_local_fossify_notes(raw),
+            }
+        elif "fossify_calendar_gui" in fixture:
+            state["fossify_calendar"] = {
+                "events": _normalize_local_fossify_calendar(raw),
+            }
+        elif "contacts_gui" in fixture:
+            state["contacts"] = {
+                "contacts": _normalize_local_contacts(raw),
+            }
+        elif "gmail_clone_gui" in fixture:
+            state["gmail_clone"] = {
+                "messages": _normalize_local_gmail_clone(raw),
+                "sent_messages": [],
+                "drafts": [],
+            }
+        elif "my_expenses_gui" in fixture:
+            state["my_expenses"] = _normalize_local_my_expenses(raw)
+        elif "loop_habit_gui" in fixture:
+            state["loop_habit"] = {
+                "habits": _normalize_local_loop_habit(raw),
+            }
+        elif "dialer_gui" in fixture:
+            state["dialer"] = {
+                "call_log": _normalize_local_dialer(raw),
+            }
+        elif "mattermost_gui" in fixture:
+            state["mattermost"] = {
+                "messages": _normalize_local_mattermost(raw),
+            }
+        elif "testmall_gui" in fixture:
+            state["testmall"] = {
+                "products": _normalize_local_testmall(raw),
             }
     return state
 
